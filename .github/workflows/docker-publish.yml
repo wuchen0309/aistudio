@@ -1,3 +1,5 @@
+# ==================== 用这个最终的、可复用的版本替换整个文件内容 ====================
+
 name: Build and Publish Docker Image to GHCR
 
 on:
@@ -26,7 +28,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@v4
         with:
-          images: ghcr.io/Your-GitHub-Username-Here/your-repo-name-here # 替换为您的小写用户名和仓库名
+          # [关键修改] 不再写死名字，而是使用GitHub的内置变量
+          images: ghcr.io/${{ github.repository }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
