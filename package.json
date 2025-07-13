@@ -1,0 +1,13 @@
+{
+  "name": "dark-proxy-server",
+  "version": "1.0.0",
+  "description": "A proxy server for AI Studio",
+  "main": "dark-server-vps.js",
+  "scripts": {
+    "start": "node dark-server-vps.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0"
+  }
+}
