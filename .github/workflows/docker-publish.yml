@@ -5,6 +5,7 @@ name: Build and Publish Docker Image to GHCR
 on:
   push:
     branches: ["main"] # 当推送到 main 分支时触发
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   build-and-push-image:
@@ -28,7 +29,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v4
         with:
-          # [关键修改] 不再写死名字，而是使用GitHub的内置变量
+          # [关键修改] 不再写死名字，而是使用 GitHub 的内置变量
           images: ghcr.io/${{ github.repository }}
 
       - name: Build and push Docker image
