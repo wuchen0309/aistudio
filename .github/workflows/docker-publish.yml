@@ -1,41 +1,29 @@
-# ==================== 用这个最终的、可复用的版本替换整个文件内容 ====================
-
-name: Build and Publish Docker Image to GHCR
-
+name: GHCR CI
+permissions:
+  contents: read
+  packages: write
 on:
   push:
-    branches: ["main"] # 当推送到 main 分支时触发
-  workflow_dispatch: # 允许手动触发
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build-and-push-image:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write # 赋予 job 写入 GitHub Packages (ghcr.io) 的权限
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+    - name: lowercase repository name
+      run: echo "IMAGE_NAME=${GITHUB_REPOSITORY@L}" >> ${GITHUB_ENV}
+      
+    - uses: actions/checkout@v4
 
-      - name: Log in to the GitHub Container Registry
-        uses: docker/login-action@v2
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Log in to GitHub Container Registry
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          # [关键修改] 不再写死名字，而是使用 GitHub 的内置变量
-          images: ghcr.io/${{ github.repository }}
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag ghcr.io/${{ env.IMAGE_NAME }}:latest
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+    - name: Push the Docker image
+      run: docker push ghcr.io/${{ env.IMAGE_NAME }}:latest
