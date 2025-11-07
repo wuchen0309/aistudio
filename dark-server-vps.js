@@ -3,434 +3,342 @@ const WebSocket = require("ws");
 const http = require("http");
 const { EventEmitter } = require("events");
 
-// ────────────────────────── 全局配置 ────────────────────────── //
+// ═══════════════════════════ 配置 ═══════════════════════════
+const CONFIG = {
+  SECRET_KEY: process.env.MY_SECRET_KEY || "123456",
+  PORT: process.env.PORT || 7860,
+  HOST: "0.0.0.0",
+  STREAMING_MODE: "fake",
+  WS_HEARTBEAT: 30000,
+  QUEUE_TIMEOUT: 600000,
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 2000,
+};
 
-const MY_SECRET_KEY = process.env.MY_SECRET_KEY || "123456";
-const DEFAULT_STREAMING_MODE = "fake";
-const WS_HEARTBEAT_INTERVAL_MS = 30000;
-const MESSAGE_QUEUE_TIMEOUT_MS = 600000;
-const REQUEST_HANDLER_MAX_RETRIES = 3;
-const REQUEST_HANDLER_RETRY_DELAY_MS = 2000;
+// ═══════════════════════════ 工具 ═══════════════════════════
+const log = (level, msg) =>
+  console[level](`[${level.toUpperCase()}] ${new Date().toISOString()} - ${msg}`);
 
-// ────────────────────────── 工具函数 ────────────────────────── //
+const genId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 
-function generateRequestId() {
-  return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
-}
+const isStream = (path) => path.includes("streamGenerateContent");
 
-function isStreamPath(path) {
-  return path.includes("streamGenerateContent");
-}
-
-// ────────────────────────── LoggingService ────────────────────────── //
-
-class LoggingService {
-  constructor(serviceName = "ProxyServer") {
-    this.serviceName = serviceName;
-  }
-
-  _formatMessage(level, message) {
-    const timestamp = new Date().toISOString();
-    return `[${level}] ${timestamp} [${this.serviceName}] - ${message}`;
-  }
-
-  info(message) {
-    console.log(this._formatMessage("INFO", message));
-  }
-
-  error(message) {
-    console.error(this._formatMessage("ERROR", message));
-  }
-
-  warn(message) {
-    console.warn(this._formatMessage("WARN", message));
-  }
-
-  debug(message) {
-    console.debug(this._formatMessage("DEBUG", message));
-  }
-}
-
-// ────────────────────────── MessageQueue ────────────────────────── //
-
-class MessageQueue extends EventEmitter {
-  constructor(timeoutMs = MESSAGE_QUEUE_TIMEOUT_MS) {
+// ═══════════════════════════ 消息队列 ═══════════════════════════
+class Queue extends EventEmitter {
+  constructor(timeout = CONFIG.QUEUE_TIMEOUT) {
     super();
-    this.messages = [];
-    this.waitingResolvers = [];
-    this.defaultTimeout = timeoutMs;
+    this.msgs = [];
+    this.waiters = [];
+    this.timeout = timeout;
     this.closed = false;
   }
 
-  enqueue(message) {
+  push(msg) {
     if (this.closed) return;
-    if (this.waitingResolvers.length > 0) {
-      const resolver = this.waitingResolvers.shift();
-      if (resolver.timeoutId) clearTimeout(resolver.timeoutId);
-      resolver.resolve(message);
-    } else {
-      this.messages.push(message);
-    }
+    const waiter = this.waiters.shift();
+    waiter ? this._resolve(waiter, msg) : this.msgs.push(msg);
   }
 
-  async dequeue(timeoutMs = this.defaultTimeout) {
-    if (this.closed) {
-      throw new Error("Queue is closed");
-    }
+  async pop(timeout = this.timeout) {
+    if (this.closed) throw new Error("Queue closed");
+    if (this.msgs.length) return this.msgs.shift();
 
     return new Promise((resolve, reject) => {
-      if (this.messages.length > 0) {
-        resolve(this.messages.shift());
-        return;
-      }
-
-      const resolver = { resolve, reject, timeoutId: null };
-      this.waitingResolvers.push(resolver);
-
-      resolver.timeoutId = setTimeout(() => {
-        const index = this.waitingResolvers.indexOf(resolver);
-        if (index !== -1) {
-          this.waitingResolvers.splice(index, 1);
+      const waiter = { resolve, reject, timer: null };
+      this.waiters.push(waiter);
+      waiter.timer = setTimeout(() => {
+        const idx = this.waiters.indexOf(waiter);
+        if (idx !== -1) {
+          this.waiters.splice(idx, 1);
           reject(new Error("Queue timeout"));
         }
-      }, timeoutMs);
+      }, timeout);
     });
   }
 
   close() {
     this.closed = true;
-    this.waitingResolvers.forEach((resolver) => {
-      if (resolver.timeoutId) clearTimeout(resolver.timeoutId);
-      resolver.reject(new Error("Queue closed"));
+    this.waiters.forEach((w) => {
+      clearTimeout(w.timer);
+      w.reject(new Error("Queue closed"));
     });
-    this.waitingResolvers = [];
-    this.messages = [];
+    this.waiters = [];
+    this.msgs = [];
+  }
+
+  _resolve(waiter, msg) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(msg);
   }
 }
 
-// ────────────────────────── ConnectionRegistry ────────────────────────── //
-
-class ConnectionRegistry extends EventEmitter {
-  constructor(logger) {
+// ═══════════════════════════ 连接管理 ═══════════════════════════
+class Connections extends EventEmitter {
+  constructor() {
     super();
-    this.logger = logger;
-    this.connections = new Set();
-    this.messageQueues = new Map();
-    this.heartbeatInterval = null;
+    this.conns = new Set();
+    this.queues = new Map();
+    this.heartbeat = null;
   }
 
-  addConnection(websocket, clientInfo) {
-    websocket.isAlive = true;
-    this.connections.add(websocket);
-    this.logger.info(`新客户端连接: ${clientInfo.address}`);
+  add(ws, info) {
+    ws.isAlive = true;
+    this.conns.add(ws);
+    log("info", `客户端连接: ${info.address}`);
 
-    websocket.on("pong", () => {
-      websocket.isAlive = true;
-    });
+    ws.on("pong", () => (ws.isAlive = true));
+    ws.on("message", (data) => this._onMessage(data.toString()));
+    ws.on("close", () => this._remove(ws));
+    ws.on("error", (err) => log("error", `WS错误: ${err.message}`));
 
-    websocket.on("message", (data) => {
-      this._handleIncomingMessage(data.toString());
-    });
-
-    websocket.on("close", () => this._removeConnection(websocket));
-
-    websocket.on("error", (error) => {
-      this.logger.error(`WebSocket连接错误: ${error.message}`);
-    });
-
-    if (this.connections.size === 1) {
-      this._startHeartbeat();
-    }
-
-    this.emit("connectionAdded", websocket);
+    if (this.conns.size === 1) this._startHeartbeat();
+    this.emit("add", ws);
   }
 
   _startHeartbeat() {
-    this.logger.info("心跳检测机制已启动。");
-    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-
-    this.heartbeatInterval = setInterval(() => {
-      this.connections.forEach((ws) => {
-        if (ws.isAlive === false) {
-          this.logger.warn("检测到僵尸连接，正在终止...");
-          ws.terminate();
-          return;
-        }
-
+    log("info", "心跳启动");
+    this.heartbeat = setInterval(() => {
+      this.conns.forEach((ws) => {
+        if (!ws.isAlive) return ws.terminate();
         ws.isAlive = false;
-        ws.ping(() => {});
+        ws.ping();
       });
-    }, WS_HEARTBEAT_INTERVAL_MS);
+    }, CONFIG.WS_HEARTBEAT);
   }
 
-  _removeConnection(websocket) {
-    this.connections.delete(websocket);
-    this.logger.info("客户端连接断开");
-
-    this.messageQueues.forEach((queue) => queue.close());
-    this.messageQueues.clear();
-
-    if (this.connections.size === 0) {
-      this._stopHeartbeat();
-    }
-
-    this.emit("connectionRemoved", websocket);
+  _remove(ws) {
+    this.conns.delete(ws);
+    log("info", "客户端断开");
+    this.queues.forEach((q) => q.close());
+    this.queues.clear();
+    if (!this.conns.size) this._stopHeartbeat();
+    this.emit("remove", ws);
   }
 
   _stopHeartbeat() {
-    if (!this.heartbeatInterval) return;
-    clearInterval(this.heartbeatInterval);
-    this.heartbeatInterval = null;
-    this.logger.info("连接全部断开，心跳检测机制已停止。");
+    if (!this.heartbeat) return;
+    clearInterval(this.heartbeat);
+    this.heartbeat = null;
+    log("info", "心跳停止");
   }
 
-  _handleIncomingMessage(messageData) {
+  _onMessage(data) {
     try {
-      const parsedMessage = JSON.parse(messageData);
-      const { request_id, event_type } = parsedMessage;
+      const msg = JSON.parse(data);
+      const queue = this.queues.get(msg.request_id);
+      if (!queue) return log("warn", `未知请求ID: ${msg.request_id}`);
 
-      if (!request_id) {
-        this.logger.warn("收到无效消息：缺少request_id");
-        return;
+      if (msg.event_type === "stream_close") {
+        queue.push({ type: "STREAM_END" });
+      } else if (["response_headers", "chunk", "error"].includes(msg.event_type)) {
+        queue.push(msg);
       }
-
-      const queue = this.messageQueues.get(request_id);
-      if (!queue) {
-        this.logger.warn(`收到未知请求ID的消息: ${request_id}`);
-        return;
-      }
-
-      switch (event_type) {
-        case "response_headers":
-        case "chunk":
-        case "error":
-          queue.enqueue(parsedMessage);
-          break;
-        case "stream_close":
-          queue.enqueue({ type: "STREAM_END" });
-          break;
-        default:
-          this.logger.warn(`未知的事件类型: ${event_type}`);
-      }
-    } catch (error) {
-      this.logger.error(`解析WebSocket消息失败: ${error.message}`);
+    } catch (err) {
+      log("error", `解析消息失败: ${err.message}`);
     }
   }
 
-  hasActiveConnections() {
-    return this.connections.size > 0;
+  hasConn() {
+    return this.conns.size > 0;
   }
 
-  getFirstConnection() {
-    const aliveConnections = Array.from(this.connections).filter(
-      (ws) => ws.isAlive
-    );
-    if (aliveConnections.length === 0 && this.connections.size > 0) {
-      this.logger.warn("有连接记录，但没有一个通过心跳检测！");
-    }
-    return aliveConnections[0];
+  getConn() {
+    return Array.from(this.conns).find((ws) => ws.isAlive);
   }
 
-  createMessageQueue(requestId) {
-    const queue = new MessageQueue();
-    this.messageQueues.set(requestId, queue);
+  createQueue(id) {
+    const queue = new Queue();
+    this.queues.set(id, queue);
     return queue;
   }
 
-  removeMessageQueue(requestId) {
-    const queue = this.messageQueues.get(requestId);
-    if (!queue) return;
-
-    queue.close();
-    this.messageQueues.delete(requestId);
+  removeQueue(id) {
+    const queue = this.queues.get(id);
+    if (queue) {
+      queue.close();
+      this.queues.delete(id);
+    }
   }
 }
 
-// ────────────────────────── RequestHandler ────────────────────────── //
-
-class RequestHandler {
-  constructor(serverSystem, connectionRegistry, logger) {
-    this.serverSystem = serverSystem;
-    this.connectionRegistry = connectionRegistry;
-    this.logger = logger;
-
-    this.maxRetries = REQUEST_HANDLER_MAX_RETRIES;
-    this.retryDelay = REQUEST_HANDLER_RETRY_DELAY_MS;
+// ═══════════════════════════ 请求处理 ═══════════════════════════
+class Handler {
+  constructor(server, conns) {
+    this.server = server;
+    this.conns = conns;
   }
 
-  async processRequest(req, res) {
-    if (!this._authorizeRequest(req, res)) return;
-    if (!this._ensureActiveConnection(res)) return;
+  async handle(req, res) {
+    if (!this._auth(req, res)) return;
+    if (!this._checkConn(res)) return;
 
-    const requestId = generateRequestId();
-    const proxyRequest = this._buildProxyRequest(req, requestId);
-    const queue = this.connectionRegistry.createMessageQueue(requestId);
+    const id = genId();
+    const proxyReq = this._buildReq(req, id);
+    const queue = this.conns.createQueue(id);
 
     try {
-      await this._dispatchByStreamingMode({
-        req,
-        res,
-        proxyRequest,
-        queue,
-      });
-    } catch (error) {
-      this._handleRequestError(error, res);
+      await this._dispatch(req, res, proxyReq, queue);
+    } catch (err) {
+      this._error(err, res);
     } finally {
-      this.connectionRegistry.removeMessageQueue(requestId);
+      this.conns.removeQueue(id);
     }
   }
 
-  // ── 授权 & 连接检查 ── //
-  _authorizeRequest(req, res) {
-    const clientKey = req.query.key;
-    if (clientKey && clientKey === MY_SECRET_KEY) {
+  _auth(req, res) {
+    const key = req.query.key;
+    if (key === CONFIG.SECRET_KEY) {
       delete req.query.key;
-      this.logger.info(`代理密码验证通过。处理请求: ${req.method} ${req.path}`);
+      log("info", `验证通过: ${req.method} ${req.path}`);
       return true;
     }
-
-    this.logger.warn(
-      `收到一个无效的或缺失的代理密码，已拒绝。请求路径: ${req.url}`
-    );
-    this._sendErrorResponse(
-      res,
-      401,
-      "Unauthorized - Invalid API Key in URL parameter"
-    );
+    log("warn", `验证失败: ${req.url}`);
+    this._send(res, 401, "Unauthorized");
     return false;
   }
 
-  _ensureActiveConnection(res) {
-    if (this.connectionRegistry.hasActiveConnections()) return true;
-    this._sendErrorResponse(res, 503, "没有可用的浏览器连接");
+  _checkConn(res) {
+    if (this.conns.hasConn()) return true;
+    this._send(res, 503, "无可用连接");
     return false;
   }
 
-  // ── 请求构造 ── //
-  _buildProxyRequest(req, requestId) {
+  _buildReq(req, id) {
+    let body = "";
+    if (Buffer.isBuffer(req.body)) body = req.body.toString("utf-8");
+    else if (typeof req.body === "string") body = req.body;
+    else if (req.body) body = JSON.stringify(req.body);
+
     return {
       path: req.path,
       method: req.method,
       headers: req.headers,
       query_params: req.query,
-      body: this._extractRequestBody(req),
-      request_id: requestId,
-      streaming_mode: this.serverSystem.streamingMode,
+      body,
+      request_id: id,
+      streaming_mode: this.server.mode,
     };
   }
 
-  _extractRequestBody(req) {
-    if (Buffer.isBuffer(req.body)) {
-      return req.body.toString("utf-8");
+  async _dispatch(req, res, proxyReq, queue) {
+    const mode = this.server.mode;
+    const stream = isStream(req.path);
+
+    if (mode === "fake") {
+      return stream
+        ? this._fakeStream(req, res, proxyReq, queue)
+        : this._fakeNonStream(res, proxyReq, queue);
     }
-    if (typeof req.body === "string") {
-      return req.body;
-    }
-    if (req.body) {
-      return JSON.stringify(req.body);
-    }
-    return "";
+    return this._realStream(res, proxyReq, queue, stream);
   }
 
-  // ── 模式分发 ── //
-  async _dispatchByStreamingMode({ req, res, proxyRequest, queue }) {
-    const mode = this.serverSystem.streamingMode;
-    return mode === "fake"
-      ? this._processFakeModeRequest({ req, res, proxyRequest, queue })
-      : this._processRealModeRequest({ res, proxyRequest, queue });
+  async _fakeNonStream(res, proxyReq, queue) {
+    log("info", "非流式请求");
+    this._forward(proxyReq);
+
+    const header = await queue.pop();
+    if (header.event_type === "error") {
+      return this._send(res, header.status || 500, header.message);
+    }
+
+    this._setHeaders(res, header);
+    const data = await queue.pop();
+    await queue.pop(); // end
+
+    if (data.data) res.send(data.data);
+    log("info", "JSON响应完成");
   }
 
-  async _processFakeModeRequest({ req, res, proxyRequest, queue }) {
-    const streamRequested = isStreamPath(req.path);
-    return streamRequested
-      ? this._handleFakeStream({ req, res, proxyRequest, queue })
-      : this._handleFakeNonStream({ res, proxyRequest, queue });
+  async _fakeStream(req, res, proxyReq, queue) {
+    this._sseHeaders(res);
+    const keepAlive = this._keepAlive(req.path);
+    const timer = setInterval(() => res.write(keepAlive), 1000);
+
+    try {
+      log("info", "假流式开始");
+      this._forward(proxyReq);
+
+      const header = await queue.pop();
+      if (header.event_type === "error") {
+        this._sseError(res, header.message);
+        throw new Error(header.message);
+      }
+
+      const data = await queue.pop();
+      await queue.pop(); // end
+
+      if (data.data) {
+        res.write(`data: ${data.data}\n\n`);
+        log("info", "SSE响应完成");
+      }
+    } finally {
+      clearInterval(timer);
+      if (!res.writableEnded) res.end();
+      log("info", "假流式结束");
+    }
   }
 
-  async _processRealModeRequest({ res, proxyRequest, queue }) {
-    const streamRequested = isStreamPath(proxyRequest.path);
-    return this._handleRealStreamResponse({
-      res,
-      proxyRequest,
-      queue,
-      isStreamRequest: streamRequested,
+  async _realStream(res, proxyReq, queue, isStreamReq) {
+    const header = await this._fetchWithRetry(proxyReq, queue);
+    if (header.event_type === "error") {
+      return this._send(res, header.status, header.message);
+    }
+
+    if (isStreamReq && !header.headers?.["content-type"]) {
+      header.headers = header.headers || {};
+      header.headers["content-type"] = "text/event-stream";
+    }
+
+    this._setHeaders(res, header);
+    log("info", "真流式开始");
+
+    try {
+      while (true) {
+        const data = await queue.pop(30000);
+        if (data.type === "STREAM_END") break;
+        if (data.data) res.write(data.data);
+      }
+    } catch (err) {
+      if (err.message !== "Queue timeout") throw err;
+      log("warn", "真流式超时");
+    } finally {
+      if (!res.writableEnded) res.end();
+      log("info", "真流式结束");
+    }
+  }
+
+  async _fetchWithRetry(proxyReq, queue) {
+    for (let i = 1; i <= CONFIG.MAX_RETRIES; i++) {
+      log("info", `请求尝试 ${i}/${CONFIG.MAX_RETRIES}`);
+      this._forward(proxyReq);
+      const header = await queue.pop();
+
+      const isError =
+        header.event_type === "error" &&
+        header.status >= 400 &&
+        header.status <= 599;
+
+      if (!isError || i === CONFIG.MAX_RETRIES) return header;
+
+      log("warn", `收到${header.status}错误，${CONFIG.RETRY_DELAY / 1000}秒后重试`);
+      await new Promise((r) => setTimeout(r, CONFIG.RETRY_DELAY));
+    }
+  }
+
+  _forward(proxyReq) {
+    const conn = this.conns.getConn();
+    if (!conn) throw new Error("无可用连接");
+    conn.send(JSON.stringify(proxyReq));
+  }
+
+  _setHeaders(res, header) {
+    res.status(header.status || 200);
+    Object.entries(header.headers || {}).forEach(([k, v]) => {
+      if (k.toLowerCase() !== "content-length") res.set(k, v);
     });
   }
 
-  // ── 假流模式 ── //
-  async _handleFakeNonStream({ res, proxyRequest, queue }) {
-    this.logger.info("检测到非流式请求，将返回原始JSON格式");
-
-    try {
-      this._forwardRequest(proxyRequest);
-
-      const headerMessage = await queue.dequeue();
-      if (headerMessage.event_type === "error") {
-        const errorText = `浏览器端报告错误: ${headerMessage.status || ""} ${
-          headerMessage.message || "未知错误"
-        }`;
-        this._sendErrorResponse(res, headerMessage.status || 500, errorText);
-        return;
-      }
-
-      this._setResponseHeaders(res, headerMessage);
-
-      const dataMessage = await queue.dequeue();
-      const endMessage = await queue.dequeue();
-
-      if (dataMessage.data) {
-        res.send(dataMessage.data);
-        this.logger.info("已将响应作为原始JSON发送");
-      }
-
-      if (endMessage.type !== "STREAM_END") {
-        this.logger.warn("未收到预期的流结束信号。");
-      }
-    } catch (error) {
-      this.logger.error(`处理非流式请求失败: ${error.message}`);
-      this._sendErrorResponse(res, 500, `代理错误: ${error.message}`);
-    }
-  }
-
-  async _handleFakeStream({ req, res, proxyRequest, queue }) {
-    this._prepareSseResponse(res);
-    const keepAliveChunk = this._getKeepAliveChunk(req.path);
-    let keepAliveTimer = null;
-
-    try {
-      keepAliveTimer = this._startKeepAlive(res, keepAliveChunk);
-      this.logger.info("已向客户端发送初始响应头，假流式计时器已启动。");
-      this.logger.info("请求已派发给浏览器端处理...");
-      this._forwardRequest(proxyRequest);
-
-      const headerMessage = await queue.dequeue();
-      if (headerMessage.event_type === "error") {
-        const errorText = `浏览器端报告错误: ${headerMessage.status || ""} ${
-          headerMessage.message || "未知错误"
-        }`;
-        this._sendErrorChunkToClient(res, errorText);
-        throw new Error(errorText);
-      }
-
-      const dataMessage = await queue.dequeue();
-      const endMessage = await queue.dequeue();
-
-      if (dataMessage.data) {
-        res.write(`data: ${dataMessage.data}\n\n`);
-        this.logger.info("已将完整响应体作为SSE事件发送。");
-      }
-
-      if (endMessage.type !== "STREAM_END") {
-        this.logger.warn("未收到预期的流结束信号。");
-      }
-    } finally {
-      this._stopKeepAlive(keepAliveTimer);
-      if (!res.writableEnded) res.end();
-      this.logger.info("假流式响应处理结束。");
-    }
-  }
-
-  _prepareSseResponse(res) {
+  _sseHeaders(res) {
     res.status(200).set({
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -438,140 +346,18 @@ class RequestHandler {
     });
   }
 
-  _startKeepAlive(res, chunk) {
-    return setInterval(() => {
-      if (!res.writableEnded) res.write(chunk);
-    }, 1000);
-  }
-
-  _stopKeepAlive(timerId) {
-    if (timerId) clearInterval(timerId);
-  }
-
-  // ── 真流模式 ── //
-  async _handleRealStreamResponse({
-    res,
-    proxyRequest,
-    queue,
-    isStreamRequest,
-  }) {
-    const headerMessage = await this._fetchResponseHeadersWithRetry({
-      proxyRequest,
-      queue,
-    });
-
-    if (headerMessage.event_type === "error") {
-      this._sendErrorResponse(
-        res,
-        headerMessage.status,
-        headerMessage.message
-      );
-      return;
-    }
-
-    if (isStreamRequest) {
-      this._ensureStreamContentType(headerMessage);
-    }
-
-    this._setResponseHeaders(res, headerMessage);
-    this.logger.info("已向客户端发送真实响应头，开始流式传输...");
-
-    try {
-      while (true) {
-        const dataMessage = await queue.dequeue(30000);
-        if (dataMessage.type === "STREAM_END") {
-          this.logger.info("收到流结束信号。");
-          break;
-        }
-        if (dataMessage.data) {
-          res.write(dataMessage.data);
-        }
-      }
-    } catch (error) {
-      if (error.message !== "Queue timeout") throw error;
-      this.logger.warn("真流式响应超时，可能流已正常结束。");
-    } finally {
-      if (!res.writableEnded) res.end();
-      this.logger.info("真流式响应连接已关闭。");
-    }
-  }
-
-  async _fetchResponseHeadersWithRetry({ proxyRequest, queue }) {
-    let headerMessage;
-
-    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      this.logger.info(`请求尝试 #${attempt}/${this.maxRetries}...`);
-      this._forwardRequest(proxyRequest);
-      headerMessage = await queue.dequeue();
-
-      const isError =
-        headerMessage.event_type === "error" &&
-        headerMessage.status >= 400 &&
-        headerMessage.status <= 599;
-
-      if (!isError || attempt === this.maxRetries) {
-        break;
-      }
-
-      this.logger.warn(
-        `收到 ${headerMessage.status} 错误，将在 ${
-          this.retryDelay / 1000
-        }秒后重试...`
-      );
-      await new Promise((resolve) => setTimeout(resolve, this.retryDelay));
-    }
-
-    return headerMessage;
-  }
-
-  _ensureStreamContentType(headerMessage) {
-    if (!headerMessage.headers) {
-      headerMessage.headers = {};
-    }
-    if (!headerMessage.headers["content-type"]) {
-      this.logger.info("为流式请求添加 Content-Type 头");
-      headerMessage.headers["content-type"] = "text/event-stream";
-    }
-  }
-
-  // ── 共享辅助方法 ── //
-  _forwardRequest(proxyRequest) {
-    const connection = this.connectionRegistry.getFirstConnection();
-    if (!connection) {
-      throw new Error("无法转发请求：没有可用的WebSocket连接。");
-    }
-
-    try {
-      connection.send(JSON.stringify(proxyRequest));
-    } catch (error) {
-      throw new Error(`请求转发失败: ${error.message}`);
-    }
-  }
-
-  _setResponseHeaders(res, headerMessage) {
-    res.status(headerMessage.status || 200);
-    const headers = headerMessage.headers || {};
-    Object.entries(headers).forEach(([name, value]) => {
-      if (name.toLowerCase() !== "content-length") {
-        res.set(name, value);
-      }
-    });
-  }
-
-  _getKeepAliveChunk(path) {
+  _keepAlive(path) {
     if (path.includes("chat/completions")) {
-      const payload = {
-        id: `chatcmpl-${generateRequestId()}`,
+      return `data: ${JSON.stringify({
+        id: `chatcmpl-${genId()}`,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model: "gpt-4",
         choices: [{ index: 0, delta: {}, finish_reason: null }],
-      };
-      return `data: ${JSON.stringify(payload)}\n\n`;
+      })}\n\n`;
     }
-
     if (path.includes("generateContent") || path.includes("streamGenerateContent")) {
-      const payload = {
+      return `data: ${JSON.stringify({
         candidates: [
           {
             content: { parts: [{ text: "" }], role: "model" },
@@ -580,196 +366,115 @@ class RequestHandler {
             safetyRatings: [],
           },
         ],
-      };
-      return `data: ${JSON.stringify(payload)}\n\n`;
+      })}\n\n`;
     }
-
     return "data: {}\n\n";
   }
 
-  _sendErrorChunkToClient(res, errorMessage) {
-    if (!res || res.writableEnded) return;
-
-    const errorPayload = {
-      error: {
-        message: `[代理系统提示] ${errorMessage}`,
-        type: "proxy_error",
-        code: "proxy_error",
-      },
-    };
-
-    const chunk = `data: ${JSON.stringify(errorPayload)}\n\n`;
-    res.write(chunk);
-    this.logger.info(`已向客户端发送标准错误信号: ${errorMessage}`);
+  _sseError(res, msg) {
+    if (res.writableEnded) return;
+    res.write(
+      `data: ${JSON.stringify({
+        error: { message: `[代理] ${msg}`, type: "proxy_error", code: "proxy_error" },
+      })}\n\n`
+    );
   }
 
-  _handleRequestError(error, res) {
+  _error(err, res) {
     if (res.headersSent) {
-      this.logger.error(`请求处理错误 (头已发送): ${error.message}`);
-      if (this.serverSystem.streamingMode === "fake") {
-        this._sendErrorChunkToClient(res, `处理失败: ${error.message}`);
-      }
+      log("error", `错误(头已发): ${err.message}`);
+      if (this.server.mode === "fake") this._sseError(res, err.message);
       if (!res.writableEnded) res.end();
       return;
     }
-
-    this.logger.error(`请求处理错误: ${error.message}`);
-    const status = error.message.includes("超时") ? 504 : 500;
-    this._sendErrorResponse(res, status, `代理错误: ${error.message}`);
+    log("error", `错误: ${err.message}`);
+    const status = err.message.includes("超时") ? 504 : 500;
+    this._send(res, status, `代理错误: ${err.message}`);
   }
 
-  _sendErrorResponse(res, status, message) {
+  _send(res, status, msg) {
     if (res.headersSent) return;
-    res.status(status || 500).type("text/plain").send(message);
+    res.status(status).type("text/plain").send(msg);
   }
 }
 
-// ────────────────────────── ProxyServerSystem ────────────────────────── //
-
-class ProxyServerSystem extends EventEmitter {
-  constructor(config = {}) {
+// ═══════════════════════════ 服务器 ═══════════════════════════
+class Server extends EventEmitter {
+  constructor() {
     super();
-
-    const port = process.env.PORT || 7860;
-    this.config = {
-      port,
-      host: "0.0.0.0",
-      ...config,
-    };
-
-    this.streamingMode = DEFAULT_STREAMING_MODE;
-    this.logger = new LoggingService("ProxyServer");
-    this.connectionRegistry = new ConnectionRegistry(this.logger);
-    this.requestHandler = new RequestHandler(
-      this,
-      this.connectionRegistry,
-      this.logger
-    );
-
+    this.mode = CONFIG.STREAMING_MODE;
+    this.conns = new Connections();
+    this.handler = new Handler(this, this.conns);
     this.server = null;
-    this.wsServer = null;
+    this.wss = null;
   }
 
   async start() {
-    try {
-      await this._startServer();
-      this.logger.info(
-        `代理服务器系统启动完成，当前模式: ${this.streamingMode}`
-      );
-      this.emit("started");
-    } catch (error) {
-      this.logger.error(`启动失败: ${error.message}`);
-      this.emit("error", error);
-      throw error;
-    }
-  }
-
-  async _startServer() {
-    const app = this._createExpressApp();
-    const httpServer = http.createServer(app);
-
-    this.server = httpServer;
-    this.wsServer = new WebSocket.Server({ server: httpServer });
-    this._bindWebSocketEvents();
-
-    return new Promise((resolve) => {
-      const { port, host } = this.config;
-      this.server.listen(port, host, () => {
-        this.logger.info(`HTTP服务器启动: http://${host}:${port}`);
-        this.logger.info(`WS服务器正在监听: ws://${host}:${port}`);
-        resolve();
-      });
-    });
-  }
-
-  _createExpressApp() {
     const app = express();
-
     app.use(express.json({ limit: "100mb" }));
     app.use(express.urlencoded({ extended: true, limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
 
-    this._registerAdminRoutes(app);
-    this._registerProxyRoutes(app);
-
-    return app;
-  }
-
-  _registerAdminRoutes(app) {
+    // 管理路由
     app.get("/admin/set-mode", (req, res) => {
-      const newMode = req.query.mode;
-      if (newMode === "fake" || newMode === "real") {
-        this.streamingMode = newMode;
-        const message = `流式响应模式已切换为: ${this.streamingMode}`;
-        this.logger.info(message);
-        res.status(200).send(message);
-        return;
+      const mode = req.query.mode;
+      if (mode === "fake" || mode === "real") {
+        this.mode = mode;
+        log("info", `模式切换: ${mode}`);
+        return res.send(`模式已切换: ${mode}`);
       }
-
-      const message = '无效的模式。请使用 "fake" 或 "real"。';
-      this.logger.warn(message);
-      res.status(400).send(message);
+      res.status(400).send('无效模式，使用 "fake" 或 "real"');
     });
 
-    app.get("/admin/get-mode", (_, res) => {
-      res.status(200).send(`当前流式响应模式为: ${this.streamingMode}`);
-    });
-  }
+    app.get("/admin/get-mode", (_, res) => res.send(`当前模式: ${this.mode}`));
 
-  _registerProxyRoutes(app) {
+    // 代理路由
     app.all(/(.*)/, (req, res, next) => {
       if (req.path === "/") {
-        this.logger.info("根目录'/'被访问，发送状态页面。");
-        if (this.connectionRegistry.hasActiveConnections()) {
-          res
-            .status(200)
-            .send("✅ A browser client is connected. The proxy is ready.");
-        } else {
-          res
-            .status(404)
-            .send("❌ No browser client connected. Please run the browser script.");
-        }
-        return;
+        log("info", "根路径访问");
+        return res
+          .status(this.conns.hasConn() ? 200 : 404)
+          .send(
+            this.conns.hasConn()
+              ? "✅ 浏览器已连接，代理就绪"
+              : "❌ 无浏览器连接，请运行浏览器脚本"
+          );
       }
-
-      if (req.path.startsWith("/admin/")) {
-        next();
-        return;
-      }
-
-      if (req.path === "/favicon.ico") {
-        res.status(204).send();
-        return;
-      }
-
-      this.requestHandler.processRequest(req, res);
+      if (req.path.startsWith("/admin/")) return next();
+      if (req.path === "/favicon.ico") return res.status(204).send();
+      this.handler.handle(req, res);
     });
-  }
 
-  _bindWebSocketEvents() {
-    this.wsServer.on("connection", (ws, req) => {
-      this.connectionRegistry.addConnection(ws, {
-        address: req.socket.remoteAddress,
+    const httpServer = http.createServer(app);
+    this.server = httpServer;
+    this.wss = new WebSocket.Server({ server: httpServer });
+
+    this.wss.on("connection", (ws, req) => {
+      this.conns.add(ws, { address: req.socket.remoteAddress });
+    });
+
+    return new Promise((resolve) => {
+      httpServer.listen(CONFIG.PORT, CONFIG.HOST, () => {
+        log("info", `HTTP: http://${CONFIG.HOST}:${CONFIG.PORT}`);
+        log("info", `WS: ws://${CONFIG.HOST}:${CONFIG.PORT}`);
+        log("info", `模式: ${this.mode}`);
+        resolve();
       });
     });
   }
 }
 
-// ────────────────────────── 启动入口 ────────────────────────── //
-
-async function initializeServer() {
-  const serverSystem = new ProxyServerSystem();
-
+// ═══════════════════════════ 启动 ═══════════════════════════
+async function main() {
+  const server = new Server();
   try {
-    await serverSystem.start();
-  } catch (error) {
-    console.error("服务器启动失败:", error.message);
+    await server.start();
+  } catch (err) {
+    console.error("启动失败:", err.message);
     process.exit(1);
   }
 }
 
-if (require.main === module) {
-  initializeServer();
-}
+if (require.main === module) main();
 
-module.exports = { ProxyServerSystem, initializeServer };
+module.exports = { Server, main };
