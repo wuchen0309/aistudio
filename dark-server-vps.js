@@ -8,7 +8,7 @@ const CONFIG = {
   SECRET_KEY: process.env.MY_SECRET_KEY || "123456",
   PORT: process.env.PORT || 7860,
   HOST: "0.0.0.0",
-  STREAMING_MODE: "fake",
+  STREAMING_MODE: "real",
   WS_HEARTBEAT: 30000,
   QUEUE_TIMEOUT: 600000,
   MAX_RETRIES: 3,
