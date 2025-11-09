@@ -3,76 +3,44 @@ const WebSocket = require("ws");
 const http = require("http");
 const { EventEmitter } = require("events");
 
-// ═══════════════════════════ 配置 ═══════════════════════════
-const CONFIG = {
-  SECRET_KEY: process.env.MY_SECRET_KEY || "123456",
-  PORT: process.env.PORT || 7860,
-  HOST: "0.0.0.0",
-  STREAMING_MODE: "real",
-  WS_HEARTBEAT: 30000,
-  QUEUE_TIMEOUT: 600000,
-  MAX_RETRIES: 3,
-  RETRY_DELAY: 2000,
-};
+const SECRET_KEY = process.env.MY_SECRET_KEY || "123456";
+const DEFAULT_STREAMING_MODE = "real";
 
-// ═══════════════════════════ 工具 ═══════════════════════════
 const log = (level, msg) =>
   console[level](`[${level.toUpperCase()}] ${new Date().toISOString()} - ${msg}`);
 
 const genId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 
-const isStream = (path) => path.includes("streamGenerateContent");
-
-// ═══════════════════════════ 消息队列 ═══════════════════════════
 class Queue extends EventEmitter {
-  constructor(timeout = CONFIG.QUEUE_TIMEOUT) {
+  constructor() {
     super();
     this.msgs = [];
     this.waiters = [];
-    this.timeout = timeout;
     this.closed = false;
   }
 
   push(msg) {
     if (this.closed) return;
     const waiter = this.waiters.shift();
-    waiter ? this._resolve(waiter, msg) : this.msgs.push(msg);
+    waiter ? waiter.resolve(msg) : this.msgs.push(msg);
   }
 
-  async pop(timeout = this.timeout) {
+  async pop() {
     if (this.closed) throw new Error("Queue closed");
     if (this.msgs.length) return this.msgs.shift();
-
     return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, timer: null };
-      this.waiters.push(waiter);
-      waiter.timer = setTimeout(() => {
-        const idx = this.waiters.indexOf(waiter);
-        if (idx !== -1) {
-          this.waiters.splice(idx, 1);
-          reject(new Error("Queue timeout"));
-        }
-      }, timeout);
+      this.waiters.push({ resolve, reject });
     });
   }
 
   close() {
     this.closed = true;
-    this.waiters.forEach((w) => {
-      clearTimeout(w.timer);
-      w.reject(new Error("Queue closed"));
-    });
+    this.waiters.forEach((w) => w.reject(new Error("Queue closed")));
     this.waiters = [];
     this.msgs = [];
   }
-
-  _resolve(waiter, msg) {
-    clearTimeout(waiter.timer);
-    waiter.resolve(msg);
-  }
 }
 
-// ═══════════════════════════ 连接管理 ═══════════════════════════
 class Connections extends EventEmitter {
   constructor() {
     super();
@@ -103,7 +71,7 @@ class Connections extends EventEmitter {
         ws.isAlive = false;
         ws.ping();
       });
-    }, CONFIG.WS_HEARTBEAT);
+    }, 30000);
   }
 
   _remove(ws) {
@@ -161,7 +129,6 @@ class Connections extends EventEmitter {
   }
 }
 
-// ═══════════════════════════ 请求处理 ═══════════════════════════
 class Handler {
   constructor(server, conns) {
     this.server = server;
@@ -187,7 +154,7 @@ class Handler {
 
   _auth(req, res) {
     const key = req.query.key;
-    if (key === CONFIG.SECRET_KEY) {
+    if (key === SECRET_KEY) {
       delete req.query.key;
       log("info", `验证通过: ${req.method} ${req.path}`);
       return true;
@@ -222,7 +189,7 @@ class Handler {
 
   async _dispatch(req, res, proxyReq, queue) {
     const mode = this.server.mode;
-    const stream = isStream(req.path);
+    const stream = req.path.includes("streamGenerateContent");
 
     if (mode === "fake") {
       return stream
@@ -243,7 +210,7 @@ class Handler {
 
     this._setHeaders(res, header);
     const data = await queue.pop();
-    await queue.pop(); // end
+    await queue.pop();
 
     if (data.data) res.send(data.data);
     log("info", "JSON响应完成");
@@ -265,7 +232,7 @@ class Handler {
       }
 
       const data = await queue.pop();
-      await queue.pop(); // end
+      await queue.pop();
 
       if (data.data) {
         res.write(`data: ${data.data}\n\n`);
@@ -279,7 +246,9 @@ class Handler {
   }
 
   async _realStream(res, proxyReq, queue, isStreamReq) {
-    const header = await this._fetchWithRetry(proxyReq, queue);
+    this._forward(proxyReq);
+    const header = await queue.pop();
+
     if (header.event_type === "error") {
       return this._send(res, header.status, header.message);
     }
@@ -294,34 +263,13 @@ class Handler {
 
     try {
       while (true) {
-        const data = await queue.pop(30000);
+        const data = await queue.pop();
         if (data.type === "STREAM_END") break;
         if (data.data) res.write(data.data);
       }
-    } catch (err) {
-      if (err.message !== "Queue timeout") throw err;
-      log("warn", "真流式超时");
     } finally {
       if (!res.writableEnded) res.end();
       log("info", "真流式结束");
-    }
-  }
-
-  async _fetchWithRetry(proxyReq, queue) {
-    for (let i = 1; i <= CONFIG.MAX_RETRIES; i++) {
-      log("info", `请求尝试 ${i}/${CONFIG.MAX_RETRIES}`);
-      this._forward(proxyReq);
-      const header = await queue.pop();
-
-      const isError =
-        header.event_type === "error" &&
-        header.status >= 400 &&
-        header.status <= 599;
-
-      if (!isError || i === CONFIG.MAX_RETRIES) return header;
-
-      log("warn", `收到${header.status}错误，${CONFIG.RETRY_DELAY / 1000}秒后重试`);
-      await new Promise((r) => setTimeout(r, CONFIG.RETRY_DELAY));
     }
   }
 
@@ -388,8 +336,7 @@ class Handler {
       return;
     }
     log("error", `错误: ${err.message}`);
-    const status = err.message.includes("超时") ? 504 : 500;
-    this._send(res, status, `代理错误: ${err.message}`);
+    this._send(res, 500, `代理错误: ${err.message}`);
   }
 
   _send(res, status, msg) {
@@ -398,15 +345,12 @@ class Handler {
   }
 }
 
-// ═══════════════════════════ 服务器 ═══════════════════════════
 class Server extends EventEmitter {
   constructor() {
     super();
-    this.mode = CONFIG.STREAMING_MODE;
+    this.mode = DEFAULT_STREAMING_MODE;
     this.conns = new Connections();
     this.handler = new Handler(this, this.conns);
-    this.server = null;
-    this.wss = null;
   }
 
   async start() {
@@ -415,7 +359,6 @@ class Server extends EventEmitter {
     app.use(express.urlencoded({ extended: true, limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
 
-    // 管理路由
     app.get("/admin/set-mode", (req, res) => {
       const mode = req.query.mode;
       if (mode === "fake" || mode === "real") {
@@ -428,7 +371,6 @@ class Server extends EventEmitter {
 
     app.get("/admin/get-mode", (_, res) => res.send(`当前模式: ${this.mode}`));
 
-    // 代理路由
     app.all(/(.*)/, (req, res, next) => {
       if (req.path === "/") {
         log("info", "根路径访问");
@@ -446,17 +388,16 @@ class Server extends EventEmitter {
     });
 
     const httpServer = http.createServer(app);
-    this.server = httpServer;
-    this.wss = new WebSocket.Server({ server: httpServer });
+    const wss = new WebSocket.Server({ server: httpServer });
 
-    this.wss.on("connection", (ws, req) => {
+    wss.on("connection", (ws, req) => {
       this.conns.add(ws, { address: req.socket.remoteAddress });
     });
 
     return new Promise((resolve) => {
-      httpServer.listen(CONFIG.PORT, CONFIG.HOST, () => {
-        log("info", `HTTP: http://${CONFIG.HOST}:${CONFIG.PORT}`);
-        log("info", `WS: ws://${CONFIG.HOST}:${CONFIG.PORT}`);
+      httpServer.listen(process.env.PORT || 7860, "0.0.0.0", () => {
+        log("info", `HTTP: http://0.0.0.0:${process.env.PORT || 7860}`);
+        log("info", `WS: ws://0.0.0.0:${process.env.PORT || 7860}`);
         log("info", `模式: ${this.mode}`);
         resolve();
       });
@@ -464,7 +405,6 @@ class Server extends EventEmitter {
   }
 }
 
-// ═══════════════════════════ 启动 ═══════════════════════════
 async function main() {
   const server = new Server();
   try {
