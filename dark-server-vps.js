@@ -397,28 +397,12 @@ class Handler {
         : [openaiBody.stop];
     }
     
-    // 思考配置 - 修复映射
-    if (openaiBody.reasoning_effort !== undefined || openaiBody.thinking_budget !== undefined) {
-      genConfig.thinkingConfig = {};
-      
-      if (openaiBody.reasoning_effort) {
-        // OpenAI reasoning_effort 到 Gemini thinkingMode 的映射
-        const effortMap = {
-          "minimal": "low",
-          "low": "low",
-          "medium": "medium",
-          "high": "high",
-        };
-        const effort = openaiBody.reasoning_effort.toLowerCase();
-        const mappedMode = effortMap[effort] || "medium";
-        genConfig.thinkingConfig.thinkingMode = mappedMode;
-        log("info", `思考模式映射: ${effort} -> ${mappedMode}`);
-      }
-      
-      if (openaiBody.thinking_budget !== undefined) {
-        genConfig.thinkingConfig.thoughtGenerationTokenBudget = Math.max(1, openaiBody.thinking_budget);
-        log("info", `思考预算: ${genConfig.thinkingConfig.thoughtGenerationTokenBudget}`);
-      }
+    // 思考配置 - 只支持数值形式的 token 预算
+    if (openaiBody.thinking_budget !== undefined && openaiBody.thinking_budget > 0) {
+      genConfig.thinkingConfig = {
+        thoughtGenerationTokenBudget: Math.max(1, Math.floor(openaiBody.thinking_budget))
+      };
+      log("info", `思考预算: ${genConfig.thinkingConfig.thoughtGenerationTokenBudget} tokens`);
     }
 
     if (Object.keys(genConfig).length > 0) {
@@ -566,7 +550,6 @@ class Handler {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
       const candidate = gemini.candidates?.[0];
       
-      // 提取文本和思考内容
       let text = "";
       let thinkingText = null;
       
@@ -605,7 +588,6 @@ class Handler {
           }],
         };
         
-        // 在最后一块添加 usage
         if (finishReason === "STOP" && usage) {
           chunk.usage = {
             prompt_tokens: usage.promptTokenCount || 0,
@@ -690,7 +672,6 @@ class Handler {
           }],
         };
         
-        // 在最后一块添加 usage
         if (finishReason === "STOP" && usage) {
           chunk.usage = {
             prompt_tokens: usage.promptTokenCount || 0,
