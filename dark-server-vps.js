@@ -146,15 +146,21 @@ class Handler {
 
     const id = genId();
     const isOpenAI = req.path.includes("/v1/chat/completions");
-    const proxyReq = this._buildReq(req, id, isOpenAI);
-    const queue = this.conns.createQueue(id);
-
+    
     try {
-      await this._dispatch(req, res, proxyReq, queue, isOpenAI);
+      const proxyReq = this._buildReq(req, id, isOpenAI);
+      const queue = this.conns.createQueue(id);
+
+      try {
+        await this._dispatch(req, res, proxyReq, queue, isOpenAI);
+      } catch (err) {
+        this._error(err, res, isOpenAI);
+      } finally {
+        this.conns.removeQueue(id);
+      }
     } catch (err) {
+      log("error", `构建请求失败: ${err.message}`);
       this._error(err, res, isOpenAI);
-    } finally {
-      this.conns.removeQueue(id);
     }
   }
 
@@ -233,7 +239,6 @@ class Handler {
     const models = geminiData.models || [];
     const openaiModels = models
       .filter(model => {
-        // 只返回 generateContent 方法的模型
         return model.supportedGenerationMethods?.includes("generateContent");
       })
       .map(model => ({
@@ -253,7 +258,6 @@ class Handler {
   }
 
   _auth(req, res) {
-    // 从 query 或 Authorization header 获取密钥
     let key = req.query.key;
     
     if (!key && req.headers.authorization) {
@@ -285,14 +289,20 @@ class Handler {
     let convertedBody = req.body;
 
     if (isOpenAI && req.body) {
-      convertedBody = this._convertOpenAIToGemini(req.body);
+      log("info", `原始 OpenAI 请求: ${JSON.stringify(req.body, null, 2)}`);
+      try {
+        convertedBody = this._convertOpenAIToGemini(req.body);
+      } catch (err) {
+        log("error", `转换失败: ${err.message}`);
+        throw err;
+      }
     }
 
     if (Buffer.isBuffer(convertedBody)) body = convertedBody.toString("utf-8");
     else if (typeof convertedBody === "string") body = convertedBody;
     else if (convertedBody) body = JSON.stringify(convertedBody);
 
-    return {
+    const finalReq = {
       path: isOpenAI ? this._convertOpenAIPath(req) : req.path,
       method: req.method,
       headers: req.headers,
@@ -302,6 +312,11 @@ class Handler {
       streaming_mode: this.server.mode,
       is_openai: isOpenAI,
     };
+
+    log("info", `最终请求路径: ${finalReq.path}`);
+    log("info", `查询参数: ${JSON.stringify(finalReq.query_params)}`);
+
+    return finalReq;
   }
 
   _convertOpenAIPath(req) {
@@ -313,6 +328,8 @@ class Handler {
 
   _convertOpenAIQuery(req) {
     const query = { ...req.query };
+    delete query.key;
+    
     if (req.body?.stream === true) {
       query.alt = "sse";
     }
@@ -336,6 +353,12 @@ class Handler {
       }
     }
 
+    // 必须有至少一条用户消息
+    if (contents.length === 0) {
+      log("error", "没有有效的用户消息");
+      throw new Error("至少需要一条用户或助手消息");
+    }
+
     const geminiBody = { contents };
     
     // 合并所有系统消息
@@ -348,26 +371,32 @@ class Handler {
     // 生成配置
     const genConfig = {};
     
-    // 基础参数
+    // 基础参数 - 添加范围验证
     if (openaiBody.temperature !== undefined) {
-      genConfig.temperature = openaiBody.temperature;
+      genConfig.temperature = Math.max(0, Math.min(2, openaiBody.temperature));
     }
     if (openaiBody.max_tokens !== undefined) {
       genConfig.maxOutputTokens = openaiBody.max_tokens;
     }
     if (openaiBody.top_p !== undefined) {
-      genConfig.topP = openaiBody.top_p;
+      genConfig.topP = Math.max(0, Math.min(1, openaiBody.top_p));
     }
     if (openaiBody.top_k !== undefined) {
-      genConfig.topK = openaiBody.top_k;
+      genConfig.topK = Math.max(1, Math.floor(openaiBody.top_k));
     }
     
-    // 其他 OpenAI 参数
+    // 只在非零时添加 penalty
     if (openaiBody.presence_penalty !== undefined) {
-      genConfig.presencePenalty = openaiBody.presence_penalty;
+      const penalty = Math.max(-2, Math.min(2, openaiBody.presence_penalty));
+      if (penalty !== 0) {
+        genConfig.presencePenalty = penalty;
+      }
     }
     if (openaiBody.frequency_penalty !== undefined) {
-      genConfig.frequencyPenalty = openaiBody.frequency_penalty;
+      const penalty = Math.max(-2, Math.min(2, openaiBody.frequency_penalty));
+      if (penalty !== 0) {
+        genConfig.frequencyPenalty = penalty;
+      }
     }
     if (openaiBody.stop !== undefined) {
       genConfig.stopSequences = Array.isArray(openaiBody.stop) 
@@ -379,16 +408,22 @@ class Handler {
     if (openaiBody.reasoning_effort !== undefined || openaiBody.thinking_budget !== undefined) {
       genConfig.thinkingConfig = {};
       if (openaiBody.reasoning_effort) {
-        genConfig.thinkingConfig.thinkingMode = openaiBody.reasoning_effort;
+        const validModes = ["low", "medium", "high"];
+        const mode = openaiBody.reasoning_effort.toLowerCase();
+        if (validModes.includes(mode)) {
+          genConfig.thinkingConfig.thinkingMode = mode;
+        }
       }
       if (openaiBody.thinking_budget !== undefined) {
-        genConfig.thinkingConfig.thoughtGenerationTokenBudget = openaiBody.thinking_budget;
+        genConfig.thinkingConfig.thoughtGenerationTokenBudget = Math.max(1, openaiBody.thinking_budget);
       }
     }
 
     if (Object.keys(genConfig).length > 0) {
       geminiBody.generationConfig = genConfig;
     }
+
+    log("info", `转换后的请求体: ${JSON.stringify(geminiBody, null, 2)}`);
 
     return geminiBody;
   }
@@ -493,14 +528,11 @@ class Handler {
         
         if (data.data) {
           if (isOpenAI && isStreamReq) {
-            // 流式：转换并立即发送
             const converted = this._convertGeminiSSEToOpenAI(data.data);
             res.write(converted);
           } else if (isOpenAI && !isStreamReq) {
-            // 非流式：累积完整响应
             fullResponse += data.data;
           } else {
-            // 原生 Gemini 格式
             res.write(data.data);
           }
         }
@@ -509,7 +541,6 @@ class Handler {
       if (isOpenAI && isStreamReq) {
         res.write("data: [DONE]\n\n");
       } else if (isOpenAI && !isStreamReq) {
-        // 处理非流式 OpenAI 响应
         const jsonResponse = this._convertGeminiToOpenAI(fullResponse, false);
         res.json(JSON.parse(jsonResponse));
       }
@@ -608,7 +639,6 @@ class Handler {
         };
         result += `data: ${JSON.stringify(chunk)}\n\n`;
       } catch (err) {
-        // 保持原始行
         result += line + "\n";
       }
     }
