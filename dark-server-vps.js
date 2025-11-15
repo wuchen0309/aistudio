@@ -394,7 +394,6 @@ class Handler {
       genConfig.thinkingConfig = {
         thoughtGenerationTokenBudget: Math.max(1, Math.floor(openaiBody.thinking_budget))
       };
-      log("info", `思考预算: ${genConfig.thinkingConfig.thoughtGenerationTokenBudget} tokens`);
     }
 
     if (Object.keys(genConfig).length > 0) {
@@ -496,7 +495,6 @@ class Handler {
     log("info", "真流式开始");
 
     let fullResponse = "";
-    let chunkCount = 0;
 
     try {
       while (true) {
@@ -504,8 +502,6 @@ class Handler {
         if (data.type === "STREAM_END") break;
         
         if (data.data) {
-          chunkCount++;
-          
           if (isOpenAI && isStreamReq) {
             const converted = this._convertGeminiSSEToOpenAI(data.data);
             res.write(converted);
@@ -525,37 +521,20 @@ class Handler {
       }
     } finally {
       if (!res.writableEnded) res.end();
-      log("info", `真流式结束 (共 ${chunkCount} 个数据块)`);
+      log("info", "真流式结束");
     }
   }
 
   _convertGeminiToOpenAI(geminiData, isStream) {
     try {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
-      
-      log("info", `===== Gemini 原始数据结构 =====`);
-      log("info", `完整数据: ${JSON.stringify(gemini, null, 2)}`);
-      
       const candidate = gemini.candidates?.[0];
       
-      if (candidate?.content?.parts) {
-        log("info", `Parts 数量: ${candidate.content.parts.length}`);
-        candidate.content.parts.forEach((part, idx) => {
-          log("info", `Part[${idx}]: ${JSON.stringify(part, null, 2)}`);
-        });
-      }
-      
       let text = "";
-      let thinkingText = null;
       
       if (candidate?.content?.parts) {
         for (const part of candidate.content.parts) {
-          log("info", `处理 part: thought=${part.thought}, text长度=${part.text?.length || 0}`);
-          
-          if (part.thought === true) {
-            thinkingText = (thinkingText || "") + (part.text || "");
-            log("info", `找到思考内容，长度: ${part.text?.length || 0}`);
-          } else if (part.text) {
+          if (part.text && !part.thought) {
             text += part.text;
           }
         }
@@ -564,15 +543,13 @@ class Handler {
       const finishReason = candidate?.finishReason;
       const usage = gemini.usageMetadata;
 
-      log("info", `最终提取 - 文本: ${text.length}, 思考: ${thinkingText ? thinkingText.length : 0}`);
       if (usage) {
-        log("info", `Token: ${usage.promptTokenCount}/${usage.candidatesTokenCount}/${usage.totalTokenCount}`);
+        log("info", `Token 统计: ${usage.promptTokenCount}/${usage.candidatesTokenCount}/${usage.totalTokenCount}`);
       }
 
       if (isStream) {
         const delta = {};
         if (text) delta.content = text;
-        if (thinkingText) delta.reasoning_content = thinkingText;
 
         const chunk = {
           id: `chatcmpl-${genId()}`,
@@ -596,11 +573,6 @@ class Handler {
         
         return `data: ${JSON.stringify(chunk)}\n\n`;
       } else {
-        const message = { role: "assistant", content: text };
-        if (thinkingText) {
-          message.reasoning_content = thinkingText;
-        }
-
         const response = {
           id: `chatcmpl-${genId()}`,
           object: "chat.completion",
@@ -608,7 +580,7 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            message: message,
+            message: { role: "assistant", content: text },
             finish_reason: finishReason === "STOP" ? "stop" : "length",
           }],
           usage: {
@@ -622,7 +594,6 @@ class Handler {
       }
     } catch (err) {
       log("error", `转换失败: ${err.message}`);
-      log("error", `堆栈: ${err.stack}`);
       return geminiData;
     }
   }
@@ -630,26 +601,20 @@ class Handler {
   _convertGeminiSSEToOpenAI(sseData) {
     const lines = sseData.split("\n");
     let result = "";
-    let lineCount = 0;
+    let accumulatedUsage = null;
 
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
-      
-      lineCount++;
       
       try {
         const gemini = JSON.parse(line.slice(6));
         const candidate = gemini.candidates?.[0];
         
         let text = "";
-        let thinkingText = null;
         
         if (candidate?.content?.parts) {
           for (const part of candidate.content.parts) {
-            if (part.thought === true) {
-              thinkingText = (thinkingText || "") + (part.text || "");
-              log("info", `SSE#${lineCount} 找到思考`);
-            } else if (part.text) {
+            if (part.text && !part.thought) {
               text += part.text;
             }
           }
@@ -658,9 +623,12 @@ class Handler {
         const finishReason = candidate?.finishReason;
         const usage = gemini.usageMetadata;
 
+        if (usage) {
+          accumulatedUsage = usage;
+        }
+
         const delta = {};
         if (text) delta.content = text;
-        if (thinkingText) delta.reasoning_content = thinkingText;
 
         const chunk = {
           id: `chatcmpl-${genId()}`,
@@ -674,12 +642,13 @@ class Handler {
           }],
         };
         
-        if (finishReason === "STOP" && usage) {
+        if (finishReason === "STOP" && accumulatedUsage) {
           chunk.usage = {
-            prompt_tokens: usage.promptTokenCount || 0,
-            completion_tokens: usage.candidatesTokenCount || 0,
-            total_tokens: usage.totalTokenCount || 0,
+            prompt_tokens: accumulatedUsage.promptTokenCount || 0,
+            completion_tokens: accumulatedUsage.candidatesTokenCount || 0,
+            total_tokens: accumulatedUsage.totalTokenCount || 0,
           };
+          log("info", `最终 Token: ${chunk.usage.total_tokens}`);
         }
         
         result += `data: ${JSON.stringify(chunk)}\n\n`;
