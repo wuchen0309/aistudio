@@ -236,16 +236,31 @@ class Handler {
 
   _convertModelsToOpenAI(geminiData) {
     const models = geminiData.models || [];
-    const openaiModels = models.map(model => ({
-      id: model.name.replace("models/", ""),
-      object: "model",
-      created: Math.floor(new Date(model.updateTime || Date.now()).getTime() / 1000),
-      owned_by: "google",
-      permission: [],
-      root: model.name.replace("models/", ""),
-      parent: null,
-    }));
+    log("info", `原始模型数量: ${models.length}`);
+    
+    const openaiModels = models.map(model => {
+      let created = Math.floor(Date.now() / 1000);
+      if (model.updateTime) {
+        try {
+          created = Math.floor(new Date(model.updateTime).getTime() / 1000);
+        } catch (e) {
+          // 使用默认值
+        }
+      }
+      
+      return {
+        id: model.name.replace("models/", ""),
+        object: "model",
+        created: created,
+        owned_by: "google",
+        permission: [],
+        root: model.name.replace("models/", ""),
+        parent: null,
+      };
+    });
 
+    log("info", `转换后模型数量: ${openaiModels.length}`);
+    
     return {
       object: "list",
       data: openaiModels,
@@ -332,12 +347,52 @@ class Handler {
 
     for (const msg of messages) {
       if (msg.role === "system") {
-        systemMessages.push(msg.content);
+        // 系统消息
+        const text = typeof msg.content === "string" 
+          ? msg.content 
+          : msg.content.find(c => c.type === "text")?.text || "";
+        systemMessages.push(text);
       } else {
-        contents.push({
-          role: msg.role === "assistant" ? "model" : "user",
-          parts: [{ text: msg.content }],
-        });
+        // 用户/助手消息
+        const parts = [];
+        
+        if (typeof msg.content === "string") {
+          // 纯文本
+          parts.push({ text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          // 多模态内容
+          for (const item of msg.content) {
+            if (item.type === "text") {
+              parts.push({ text: item.text });
+            } else if (item.type === "image_url") {
+              const imageUrl = item.image_url.url;
+              
+              if (imageUrl.startsWith("data:")) {
+                // Base64 图片
+                const match = imageUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+                if (match) {
+                  const mimeType = `image/${match[1]}`;
+                  const data = match[2];
+                  parts.push({
+                    inlineData: {
+                      mimeType: mimeType,
+                      data: data
+                    }
+                  });
+                }
+              } else if (imageUrl.startsWith("http")) {
+                log("warn", "暂不支持 HTTP URL 图片，请使用 base64");
+              }
+            }
+          }
+        }
+        
+        if (parts.length > 0) {
+          contents.push({
+            role: msg.role === "assistant" ? "model" : "user",
+            parts: parts
+          });
+        }
       }
     }
 
