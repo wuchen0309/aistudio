@@ -236,19 +236,15 @@ class Handler {
 
   _convertModelsToOpenAI(geminiData) {
     const models = geminiData.models || [];
-    const openaiModels = models
-      .filter(model => {
-        return model.supportedGenerationMethods?.includes("generateContent");
-      })
-      .map(model => ({
-        id: model.name.replace("models/", ""),
-        object: "model",
-        created: Math.floor(new Date(model.updateTime || Date.now()).getTime() / 1000),
-        owned_by: "google",
-        permission: [],
-        root: model.name.replace("models/", ""),
-        parent: null,
-      }));
+    const openaiModels = models.map(model => ({
+      id: model.name.replace("models/", ""),
+      object: "model",
+      created: Math.floor(new Date(model.updateTime || Date.now()).getTime() / 1000),
+      owned_by: "google",
+      permission: [],
+      root: model.name.replace("models/", ""),
+      parent: null,
+    }));
 
     return {
       object: "list",
@@ -529,28 +525,10 @@ class Handler {
     try {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
       const candidate = gemini.candidates?.[0];
-      
-      let text = "";
-      
-      if (candidate?.content?.parts) {
-        for (const part of candidate.content.parts) {
-          if (part.text && !part.thought) {
-            text += part.text;
-          }
-        }
-      }
-      
+      const text = candidate?.content?.parts?.map(p => p.text || "").join("") || "";
       const finishReason = candidate?.finishReason;
-      const usage = gemini.usageMetadata;
-
-      if (usage) {
-        log("info", `Token 统计: ${usage.promptTokenCount}/${usage.candidatesTokenCount}/${usage.totalTokenCount}`);
-      }
 
       if (isStream) {
-        const delta = {};
-        if (text) delta.content = text;
-
         const chunk = {
           id: `chatcmpl-${genId()}`,
           object: "chat.completion.chunk",
@@ -558,18 +536,10 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: delta,
+            delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         };
-        
-        if (finishReason === "STOP" && usage) {
-          chunk.usage = {
-            prompt_tokens: usage.promptTokenCount || 0,
-            completion_tokens: usage.candidatesTokenCount || 0,
-            total_tokens: usage.totalTokenCount || 0,
-          };
-        }
         
         return `data: ${JSON.stringify(chunk)}\n\n`;
       } else {
@@ -580,14 +550,12 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            message: { role: "assistant", content: text },
+            message: {
+              role: "assistant",
+              content: text,
+            },
             finish_reason: finishReason === "STOP" ? "stop" : "length",
           }],
-          usage: {
-            prompt_tokens: usage?.promptTokenCount || 0,
-            completion_tokens: usage?.candidatesTokenCount || 0,
-            total_tokens: usage?.totalTokenCount || 0,
-          },
         };
 
         return JSON.stringify(response);
@@ -601,7 +569,6 @@ class Handler {
   _convertGeminiSSEToOpenAI(sseData) {
     const lines = sseData.split("\n");
     let result = "";
-    let accumulatedUsage = null;
 
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
@@ -609,26 +576,8 @@ class Handler {
       try {
         const gemini = JSON.parse(line.slice(6));
         const candidate = gemini.candidates?.[0];
-        
-        let text = "";
-        
-        if (candidate?.content?.parts) {
-          for (const part of candidate.content.parts) {
-            if (part.text && !part.thought) {
-              text += part.text;
-            }
-          }
-        }
-        
+        const text = candidate?.content?.parts?.map(p => p.text || "").join("") || "";
         const finishReason = candidate?.finishReason;
-        const usage = gemini.usageMetadata;
-
-        if (usage) {
-          accumulatedUsage = usage;
-        }
-
-        const delta = {};
-        if (text) delta.content = text;
 
         const chunk = {
           id: `chatcmpl-${genId()}`,
@@ -637,19 +586,10 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: delta,
+            delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         };
-        
-        if (finishReason === "STOP" && accumulatedUsage) {
-          chunk.usage = {
-            prompt_tokens: accumulatedUsage.promptTokenCount || 0,
-            completion_tokens: accumulatedUsage.candidatesTokenCount || 0,
-            total_tokens: accumulatedUsage.totalTokenCount || 0,
-          };
-          log("info", `最终 Token: ${chunk.usage.total_tokens}`);
-        }
         
         result += `data: ${JSON.stringify(chunk)}\n\n`;
       } catch (err) {
