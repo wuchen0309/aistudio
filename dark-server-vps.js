@@ -548,22 +548,14 @@ class Handler {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
       const candidate = gemini.candidates?.[0];
       
-      // 提取所有内容（文本和图片）
-      const contentParts = [];
+      // 转换为文本（包括 Markdown 图片）
+      let text = "";
       if (candidate?.content?.parts) {
         for (const part of candidate.content.parts) {
           if (part.text) {
-            contentParts.push({
-              type: "text",
-              text: part.text
-            });
+            text += part.text;
           } else if (part.inlineData) {
-            contentParts.push({
-              type: "image_url",
-              image_url: {
-                url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-              }
-            });
+            text += `\n![image](data:${part.inlineData.mimeType};base64,${part.inlineData.data})\n`;
           }
         }
       }
@@ -571,14 +563,6 @@ class Handler {
       const finishReason = candidate?.finishReason;
 
       if (isStream) {
-        const delta = {};
-        
-        if (contentParts.length === 1 && contentParts[0].type === "text") {
-          delta.content = contentParts[0].text;
-        } else if (contentParts.length > 0) {
-          delta.content = contentParts;
-        }
-
         return `data: ${JSON.stringify({
           id: `chatcmpl-${genId()}`,
           object: "chat.completion.chunk",
@@ -586,21 +570,11 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: delta,
+            delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         })}\n\n`;
       } else {
-        let messageContent;
-        
-        if (contentParts.length === 1 && contentParts[0].type === "text") {
-          messageContent = contentParts[0].text;
-        } else if (contentParts.length > 0) {
-          messageContent = contentParts;
-        } else {
-          messageContent = "";
-        }
-
         return JSON.stringify({
           id: `chatcmpl-${genId()}`,
           object: "chat.completion",
@@ -610,7 +584,7 @@ class Handler {
             index: 0,
             message: {
               role: "assistant",
-              content: messageContent
+              content: text
             },
             finish_reason: finishReason === "STOP" ? "stop" : "length",
           }],
@@ -633,33 +607,18 @@ class Handler {
         const gemini = JSON.parse(line.slice(6));
         const candidate = gemini.candidates?.[0];
         
-        const contentParts = [];
+        let text = "";
         if (candidate?.content?.parts) {
           for (const part of candidate.content.parts) {
             if (part.text) {
-              contentParts.push({
-                type: "text",
-                text: part.text
-              });
+              text += part.text;
             } else if (part.inlineData) {
-              contentParts.push({
-                type: "image_url",
-                image_url: {
-                  url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-                }
-              });
+              text += `\n![image](data:${part.inlineData.mimeType};base64,${part.inlineData.data})\n`;
             }
           }
         }
         
         const finishReason = candidate?.finishReason;
-        const delta = {};
-        
-        if (contentParts.length === 1 && contentParts[0].type === "text") {
-          delta.content = contentParts[0].text;
-        } else if (contentParts.length > 0) {
-          delta.content = contentParts;
-        }
 
         result += `data: ${JSON.stringify({
           id: `chatcmpl-${genId()}`,
@@ -668,7 +627,7 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: delta,
+            delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         })}\n\n`;
