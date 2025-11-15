@@ -160,11 +160,17 @@ class Handler {
 
   _handleModels(req, res) {
     log("info", "模型列表请求");
-    res.json({
+    res.status(200).json({
       object: "list",
       data: [
         {
           id: "gemini-2.0-flash-exp",
+          object: "model",
+          created: 1700000000,
+          owned_by: "google",
+        },
+        {
+          id: "gemini-exp-1206",
           object: "model",
           created: 1700000000,
           owned_by: "google",
@@ -216,14 +222,14 @@ class Handler {
       return true;
     }
     
-    log("warn", `验证失败: ${req.path} (提供的密钥: ${key ? key.substring(0, 3) + "***" : "无"})`);
-    this._send(res, 401, "Unauthorized");
+    log("warn", `验证失败: ${req.path}`);
+    this._send(res, 401, "Unauthorized", false);
     return false;
   }
 
   _checkConn(res) {
     if (this.conns.hasConn()) return true;
-    this._send(res, 503, "无可用连接");
+    this._send(res, 503, "无可用连接", false);
     return false;
   }
 
@@ -269,11 +275,12 @@ class Handler {
   _convertOpenAIToGemini(openaiBody) {
     const messages = openaiBody.messages || [];
     const contents = [];
-    let systemInstruction = null;
+    const systemMessages = [];
 
+    // 分离系统消息和其他消息
     for (const msg of messages) {
       if (msg.role === "system") {
-        systemInstruction = { parts: [{ text: msg.content }] };
+        systemMessages.push(msg.content);
       } else {
         contents.push({
           role: msg.role === "assistant" ? "model" : "user",
@@ -283,17 +290,57 @@ class Handler {
     }
 
     const geminiBody = { contents };
-    if (systemInstruction) {
-      geminiBody.systemInstruction = systemInstruction;
+    
+    // 合并所有系统消息
+    if (systemMessages.length > 0) {
+      geminiBody.systemInstruction = {
+        parts: [{ text: systemMessages.join("\n\n") }]
+      };
     }
 
+    // 生成配置
+    const genConfig = {};
+    
+    // 基础参数
     if (openaiBody.temperature !== undefined) {
-      geminiBody.generationConfig = geminiBody.generationConfig || {};
-      geminiBody.generationConfig.temperature = openaiBody.temperature;
+      genConfig.temperature = openaiBody.temperature;
     }
     if (openaiBody.max_tokens !== undefined) {
-      geminiBody.generationConfig = geminiBody.generationConfig || {};
-      geminiBody.generationConfig.maxOutputTokens = openaiBody.max_tokens;
+      genConfig.maxOutputTokens = openaiBody.max_tokens;
+    }
+    if (openaiBody.top_p !== undefined) {
+      genConfig.topP = openaiBody.top_p;
+    }
+    if (openaiBody.top_k !== undefined) {
+      genConfig.topK = openaiBody.top_k;
+    }
+    
+    // 其他 OpenAI 参数
+    if (openaiBody.presence_penalty !== undefined) {
+      genConfig.presencePenalty = openaiBody.presence_penalty;
+    }
+    if (openaiBody.frequency_penalty !== undefined) {
+      genConfig.frequencyPenalty = openaiBody.frequency_penalty;
+    }
+    if (openaiBody.stop !== undefined) {
+      genConfig.stopSequences = Array.isArray(openaiBody.stop) 
+        ? openaiBody.stop 
+        : [openaiBody.stop];
+    }
+    
+    // 思考配置
+    if (openaiBody.reasoning_effort !== undefined || openaiBody.thinking_budget !== undefined) {
+      genConfig.thinkingConfig = {};
+      if (openaiBody.reasoning_effort) {
+        genConfig.thinkingConfig.thinkingMode = openaiBody.reasoning_effort;
+      }
+      if (openaiBody.thinking_budget !== undefined) {
+        genConfig.thinkingConfig.thoughtGenerationTokenBudget = openaiBody.thinking_budget;
+      }
+    }
+
+    if (Object.keys(genConfig).length > 0) {
+      geminiBody.generationConfig = genConfig;
     }
 
     return geminiBody;
@@ -327,10 +374,12 @@ class Handler {
     await queue.pop();
 
     if (data.data) {
-      const responseData = isOpenAI 
-        ? this._convertGeminiToOpenAI(data.data, false) 
-        : data.data;
-      res.send(responseData);
+      if (isOpenAI) {
+        const responseData = this._convertGeminiToOpenAI(data.data, false);
+        res.json(JSON.parse(responseData));
+      } else {
+        res.send(data.data);
+      }
     }
     log("info", "JSON响应完成");
   }
@@ -356,15 +405,12 @@ class Handler {
       await queue.pop();
 
       if (data.data) {
-        const responseData = isOpenAI 
-          ? this._convertGeminiToOpenAI(data.data, true) 
-          : data.data;
-        
         if (isOpenAI) {
+          const responseData = this._convertGeminiToOpenAI(data.data, true);
           res.write(responseData);
           res.write("data: [DONE]\n\n");
         } else {
-          res.write(`data: ${responseData}\n\n`);
+          res.write(`data: ${data.data}\n\n`);
         }
         log("info", "SSE响应完成");
       }
@@ -391,23 +437,34 @@ class Handler {
     this._setHeaders(res, header);
     log("info", "真流式开始");
 
+    let fullResponse = "";
+
     try {
       while (true) {
         const data = await queue.pop();
         if (data.type === "STREAM_END") break;
         
         if (data.data) {
-          if (isOpenAI) {
+          if (isOpenAI && isStreamReq) {
+            // 流式：转换并立即发送
             const converted = this._convertGeminiSSEToOpenAI(data.data);
             res.write(converted);
+          } else if (isOpenAI && !isStreamReq) {
+            // 非流式：累积完整响应
+            fullResponse += data.data;
           } else {
+            // 原生 Gemini 格式
             res.write(data.data);
           }
         }
       }
       
-      if (isOpenAI) {
+      if (isOpenAI && isStreamReq) {
         res.write("data: [DONE]\n\n");
+      } else if (isOpenAI && !isStreamReq) {
+        // 处理非流式 OpenAI 响应
+        const jsonResponse = this._convertGeminiToOpenAI(fullResponse, false);
+        res.json(JSON.parse(jsonResponse));
       }
     } finally {
       if (!res.writableEnded) res.end();
@@ -418,10 +475,17 @@ class Handler {
   _convertGeminiToOpenAI(geminiData, isStream) {
     try {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
-      const text = gemini.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const finishReason = gemini.candidates?.[0]?.finishReason;
+      const candidate = gemini.candidates?.[0];
+      const text = candidate?.content?.parts?.find(p => !p.thought)?.text || "";
+      const thinkingText = candidate?.content?.parts?.find(p => p.thought === true)?.text || null;
+      const finishReason = candidate?.finishReason;
+      const usage = gemini.usageMetadata;
 
       if (isStream) {
+        const delta = {};
+        if (text) delta.content = text;
+        if (thinkingText) delta.reasoning_content = thinkingText;
+
         const chunk = {
           id: `chatcmpl-${genId()}`,
           object: "chat.completion.chunk",
@@ -429,28 +493,36 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: { content: text },
+            delta: delta,
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         };
+        
         return `data: ${JSON.stringify(chunk)}\n\n`;
       } else {
-        return JSON.stringify({
+        const message = { role: "assistant", content: text };
+        if (thinkingText) {
+          message.reasoning_content = thinkingText;
+        }
+
+        const response = {
           id: `chatcmpl-${genId()}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model: "gpt-4",
           choices: [{
             index: 0,
-            message: { role: "assistant", content: text },
+            message: message,
             finish_reason: finishReason === "STOP" ? "stop" : "length",
           }],
           usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
+            prompt_tokens: usage?.promptTokenCount || 0,
+            completion_tokens: usage?.candidatesTokenCount || 0,
+            total_tokens: usage?.totalTokenCount || 0,
           },
-        });
+        };
+
+        return JSON.stringify(response);
       }
     } catch (err) {
       log("error", `转换失败: ${err.message}`);
@@ -467,8 +539,14 @@ class Handler {
       
       try {
         const gemini = JSON.parse(line.slice(6));
-        const text = gemini.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        const finishReason = gemini.candidates?.[0]?.finishReason;
+        const candidate = gemini.candidates?.[0];
+        const text = candidate?.content?.parts?.find(p => !p.thought)?.text || "";
+        const thinkingText = candidate?.content?.parts?.find(p => p.thought === true)?.text || null;
+        const finishReason = candidate?.finishReason;
+
+        const delta = {};
+        if (text) delta.content = text;
+        if (thinkingText) delta.reasoning_content = thinkingText;
 
         const chunk = {
           id: `chatcmpl-${genId()}`,
@@ -477,7 +555,7 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: text ? { content: text } : {},
+            delta: delta,
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         };
@@ -550,23 +628,15 @@ class Handler {
   _sseError(res, msg, isOpenAI) {
     if (res.writableEnded) return;
     
-    if (isOpenAI) {
-      res.write(
-        `data: ${JSON.stringify({
-          error: {
-            message: `[代理] ${msg}`,
-            type: "proxy_error",
-            code: "proxy_error",
-          },
-        })}\n\n`
-      );
-    } else {
-      res.write(
-        `data: ${JSON.stringify({
-          error: { message: `[代理] ${msg}`, type: "proxy_error", code: "proxy_error" },
-        })}\n\n`
-      );
-    }
+    res.write(
+      `data: ${JSON.stringify({
+        error: {
+          message: `[代理] ${msg}`,
+          type: "proxy_error",
+          code: "proxy_error",
+        },
+      })}\n\n`
+    );
   }
 
   _error(err, res, isOpenAI) {
@@ -583,7 +653,11 @@ class Handler {
   _send(res, status, msg, isOpenAI) {
     if (res.headersSent) return;
     
-    if (isOpenAI && status >=",
+    if (isOpenAI && status >= 400) {
+      res.status(status).json({
+        error: {
+          message: msg,
+          type: "proxy_error",
           code: "proxy_error",
         },
       });
