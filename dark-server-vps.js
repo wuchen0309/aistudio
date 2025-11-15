@@ -136,7 +136,6 @@ class Handler {
   }
 
   async handle(req, res) {
-    // 特殊路径
     if (req.path === "/v1/models") {
       return this._handleModels(req, res);
     }
@@ -341,7 +340,6 @@ class Handler {
     const contents = [];
     const systemMessages = [];
 
-    // 分离系统消息和其他消息
     for (const msg of messages) {
       if (msg.role === "system") {
         systemMessages.push(msg.content);
@@ -353,7 +351,6 @@ class Handler {
       }
     }
 
-    // 必须有至少一条用户消息
     if (contents.length === 0) {
       log("error", "没有有效的用户消息");
       throw new Error("至少需要一条用户或助手消息");
@@ -361,17 +358,14 @@ class Handler {
 
     const geminiBody = { contents };
     
-    // 合并所有系统消息
     if (systemMessages.length > 0) {
       geminiBody.systemInstruction = {
         parts: [{ text: systemMessages.join("\n\n") }]
       };
     }
 
-    // 生成配置
     const genConfig = {};
     
-    // 基础参数 - 添加范围验证
     if (openaiBody.temperature !== undefined) {
       genConfig.temperature = Math.max(0, Math.min(2, openaiBody.temperature));
     }
@@ -385,7 +379,6 @@ class Handler {
       genConfig.topK = Math.max(1, Math.floor(openaiBody.top_k));
     }
     
-    // 只在非零时添加 penalty
     if (openaiBody.presence_penalty !== undefined) {
       const penalty = Math.max(-2, Math.min(2, openaiBody.presence_penalty));
       if (penalty !== 0) {
@@ -404,18 +397,27 @@ class Handler {
         : [openaiBody.stop];
     }
     
-    // 思考配置
+    // 思考配置 - 修复映射
     if (openaiBody.reasoning_effort !== undefined || openaiBody.thinking_budget !== undefined) {
       genConfig.thinkingConfig = {};
+      
       if (openaiBody.reasoning_effort) {
-        const validModes = ["low", "medium", "high"];
-        const mode = openaiBody.reasoning_effort.toLowerCase();
-        if (validModes.includes(mode)) {
-          genConfig.thinkingConfig.thinkingMode = mode;
-        }
+        // OpenAI reasoning_effort 到 Gemini thinkingMode 的映射
+        const effortMap = {
+          "minimal": "low",
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+        };
+        const effort = openaiBody.reasoning_effort.toLowerCase();
+        const mappedMode = effortMap[effort] || "medium";
+        genConfig.thinkingConfig.thinkingMode = mappedMode;
+        log("info", `思考模式映射: ${effort} -> ${mappedMode}`);
       }
+      
       if (openaiBody.thinking_budget !== undefined) {
         genConfig.thinkingConfig.thoughtGenerationTokenBudget = Math.max(1, openaiBody.thinking_budget);
+        log("info", `思考预算: ${genConfig.thinkingConfig.thoughtGenerationTokenBudget}`);
       }
     }
 
@@ -457,6 +459,7 @@ class Handler {
 
     if (data.data) {
       if (isOpenAI) {
+        log("info", `Gemini 原始响应: ${data.data.substring(0, 500)}...`);
         const responseData = this._convertGeminiToOpenAI(data.data, false);
         res.json(JSON.parse(responseData));
       } else {
@@ -488,6 +491,7 @@ class Handler {
 
       if (data.data) {
         if (isOpenAI) {
+          log("info", `Gemini 原始响应: ${data.data.substring(0, 500)}...`);
           const responseData = this._convertGeminiToOpenAI(data.data, true);
           res.write(responseData);
           res.write("data: [DONE]\n\n");
@@ -520,6 +524,7 @@ class Handler {
     log("info", "真流式开始");
 
     let fullResponse = "";
+    let chunkCount = 0;
 
     try {
       while (true) {
@@ -527,6 +532,11 @@ class Handler {
         if (data.type === "STREAM_END") break;
         
         if (data.data) {
+          chunkCount++;
+          if (chunkCount <= 2) {
+            log("info", `收到数据块 #${chunkCount}: ${data.data.substring(0, 200)}...`);
+          }
+          
           if (isOpenAI && isStreamReq) {
             const converted = this._convertGeminiSSEToOpenAI(data.data);
             res.write(converted);
@@ -541,12 +551,13 @@ class Handler {
       if (isOpenAI && isStreamReq) {
         res.write("data: [DONE]\n\n");
       } else if (isOpenAI && !isStreamReq) {
+        log("info", `完整响应: ${fullResponse.substring(0, 500)}...`);
         const jsonResponse = this._convertGeminiToOpenAI(fullResponse, false);
         res.json(JSON.parse(jsonResponse));
       }
     } finally {
       if (!res.writableEnded) res.end();
-      log("info", "真流式结束");
+      log("info", `真流式结束 (共 ${chunkCount} 个数据块)`);
     }
   }
 
@@ -554,10 +565,28 @@ class Handler {
     try {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
       const candidate = gemini.candidates?.[0];
-      const text = candidate?.content?.parts?.find(p => !p.thought)?.text || "";
-      const thinkingText = candidate?.content?.parts?.find(p => p.thought === true)?.text || null;
+      
+      // 提取文本和思考内容
+      let text = "";
+      let thinkingText = null;
+      
+      if (candidate?.content?.parts) {
+        for (const part of candidate.content.parts) {
+          if (part.thought === true) {
+            thinkingText = (thinkingText || "") + (part.text || "");
+          } else if (part.text) {
+            text += part.text;
+          }
+        }
+      }
+      
       const finishReason = candidate?.finishReason;
       const usage = gemini.usageMetadata;
+
+      log("info", `提取内容 - 文本长度: ${text.length}, 思考长度: ${thinkingText ? thinkingText.length : 0}`);
+      if (usage) {
+        log("info", `Token 使用: prompt=${usage.promptTokenCount}, completion=${usage.candidatesTokenCount}, total=${usage.totalTokenCount}`);
+      }
 
       if (isStream) {
         const delta = {};
@@ -575,6 +604,15 @@ class Handler {
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         };
+        
+        // 在最后一块添加 usage
+        if (finishReason === "STOP" && usage) {
+          chunk.usage = {
+            prompt_tokens: usage.promptTokenCount || 0,
+            completion_tokens: usage.candidatesTokenCount || 0,
+            total_tokens: usage.totalTokenCount || 0,
+          };
+        }
         
         return `data: ${JSON.stringify(chunk)}\n\n`;
       } else {
@@ -604,6 +642,7 @@ class Handler {
       }
     } catch (err) {
       log("error", `转换失败: ${err.message}`);
+      log("error", `原始数据: ${JSON.stringify(geminiData).substring(0, 500)}`);
       return geminiData;
     }
   }
@@ -618,9 +657,22 @@ class Handler {
       try {
         const gemini = JSON.parse(line.slice(6));
         const candidate = gemini.candidates?.[0];
-        const text = candidate?.content?.parts?.find(p => !p.thought)?.text || "";
-        const thinkingText = candidate?.content?.parts?.find(p => p.thought === true)?.text || null;
+        
+        let text = "";
+        let thinkingText = null;
+        
+        if (candidate?.content?.parts) {
+          for (const part of candidate.content.parts) {
+            if (part.thought === true) {
+              thinkingText = (thinkingText || "") + (part.text || "");
+            } else if (part.text) {
+              text += part.text;
+            }
+          }
+        }
+        
         const finishReason = candidate?.finishReason;
+        const usage = gemini.usageMetadata;
 
         const delta = {};
         if (text) delta.content = text;
@@ -637,6 +689,16 @@ class Handler {
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         };
+        
+        // 在最后一块添加 usage
+        if (finishReason === "STOP" && usage) {
+          chunk.usage = {
+            prompt_tokens: usage.promptTokenCount || 0,
+            completion_tokens: usage.candidatesTokenCount || 0,
+            total_tokens: usage.totalTokenCount || 0,
+          };
+        }
+        
         result += `data: ${JSON.stringify(chunk)}\n\n`;
       } catch (err) {
         result += line + "\n";
