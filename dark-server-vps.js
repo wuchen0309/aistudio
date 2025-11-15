@@ -236,31 +236,13 @@ class Handler {
 
   _convertModelsToOpenAI(geminiData) {
     const models = geminiData.models || [];
-    log("info", `原始模型数量: ${models.length}`);
-    
-    const openaiModels = models.map(model => {
-      let created = Math.floor(Date.now() / 1000);
-      if (model.updateTime) {
-        try {
-          created = Math.floor(new Date(model.updateTime).getTime() / 1000);
-        } catch (e) {
-          // 使用默认值
-        }
-      }
-      
-      return {
-        id: model.name.replace("models/", ""),
-        object: "model",
-        created: created,
-        owned_by: "google",
-        permission: [],
-        root: model.name.replace("models/", ""),
-        parent: null,
-      };
-    });
+    const openaiModels = models.map(model => ({
+      id: model.name.replace("models/", ""),
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: "google",
+    }));
 
-    log("info", `转换后模型数量: ${openaiModels.length}`);
-    
     return {
       object: "list",
       data: openaiModels,
@@ -347,20 +329,16 @@ class Handler {
 
     for (const msg of messages) {
       if (msg.role === "system") {
-        // 系统消息
         const text = typeof msg.content === "string" 
           ? msg.content 
           : msg.content.find(c => c.type === "text")?.text || "";
         systemMessages.push(text);
       } else {
-        // 用户/助手消息
         const parts = [];
         
         if (typeof msg.content === "string") {
-          // 纯文本
           parts.push({ text: msg.content });
         } else if (Array.isArray(msg.content)) {
-          // 多模态内容
           for (const item of msg.content) {
             if (item.type === "text") {
               parts.push({ text: item.text });
@@ -368,20 +346,15 @@ class Handler {
               const imageUrl = item.image_url.url;
               
               if (imageUrl.startsWith("data:")) {
-                // Base64 图片
                 const match = imageUrl.match(/^data:image\/(\w+);base64,(.+)$/);
                 if (match) {
-                  const mimeType = `image/${match[1]}`;
-                  const data = match[2];
                   parts.push({
                     inlineData: {
-                      mimeType: mimeType,
-                      data: data
+                      mimeType: `image/${match[1]}`,
+                      data: match[2]
                     }
                   });
                 }
-              } else if (imageUrl.startsWith("http")) {
-                log("warn", "暂不支持 HTTP URL 图片，请使用 base64");
               }
             }
           }
@@ -422,25 +395,19 @@ class Handler {
     if (openaiBody.top_k !== undefined) {
       genConfig.topK = Math.max(1, Math.floor(openaiBody.top_k));
     }
-    
     if (openaiBody.presence_penalty !== undefined) {
       const penalty = Math.max(-2, Math.min(2, openaiBody.presence_penalty));
-      if (penalty !== 0) {
-        genConfig.presencePenalty = penalty;
-      }
+      if (penalty !== 0) genConfig.presencePenalty = penalty;
     }
     if (openaiBody.frequency_penalty !== undefined) {
       const penalty = Math.max(-2, Math.min(2, openaiBody.frequency_penalty));
-      if (penalty !== 0) {
-        genConfig.frequencyPenalty = penalty;
-      }
+      if (penalty !== 0) genConfig.frequencyPenalty = penalty;
     }
     if (openaiBody.stop !== undefined) {
       genConfig.stopSequences = Array.isArray(openaiBody.stop) 
         ? openaiBody.stop 
         : [openaiBody.stop];
     }
-    
     if (openaiBody.thinking_budget !== undefined && openaiBody.thinking_budget > 0) {
       genConfig.thinkingConfig = {
         thoughtGenerationTokenBudget: Math.max(1, Math.floor(openaiBody.thinking_budget))
@@ -584,7 +551,7 @@ class Handler {
       const finishReason = candidate?.finishReason;
 
       if (isStream) {
-        const chunk = {
+        return `data: ${JSON.stringify({
           id: `chatcmpl-${genId()}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
@@ -594,26 +561,19 @@ class Handler {
             delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
-        };
-        
-        return `data: ${JSON.stringify(chunk)}\n\n`;
+        })}\n\n`;
       } else {
-        const response = {
+        return JSON.stringify({
           id: `chatcmpl-${genId()}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model: "gpt-4",
           choices: [{
             index: 0,
-            message: {
-              role: "assistant",
-              content: text,
-            },
+            message: { role: "assistant", content: text },
             finish_reason: finishReason === "STOP" ? "stop" : "length",
           }],
-        };
-
-        return JSON.stringify(response);
+        });
       }
     } catch (err) {
       log("error", `转换失败: ${err.message}`);
@@ -634,7 +594,7 @@ class Handler {
         const text = candidate?.content?.parts?.map(p => p.text || "").join("") || "";
         const finishReason = candidate?.finishReason;
 
-        const chunk = {
+        result += `data: ${JSON.stringify({
           id: `chatcmpl-${genId()}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
@@ -644,9 +604,7 @@ class Handler {
             delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
-        };
-        
-        result += `data: ${JSON.stringify(chunk)}\n\n`;
+        })}\n\n`;
       } catch (err) {
         result += line + "\n";
       }
