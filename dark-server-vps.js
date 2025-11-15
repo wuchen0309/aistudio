@@ -140,20 +140,21 @@ class Handler {
     if (!this._checkConn(res)) return;
 
     const id = genId();
-    const proxyReq = this._buildReq(req, id);
+    const isOpenAI = req.path.includes("/v1/chat/completions");
+    const proxyReq = this._buildReq(req, id, isOpenAI);
     const queue = this.conns.createQueue(id);
 
     try {
-      await this._dispatch(req, res, proxyReq, queue);
+      await this._dispatch(req, res, proxyReq, queue, isOpenAI);
     } catch (err) {
-      this._error(err, res);
+      this._error(err, res, isOpenAI);
     } finally {
       this.conns.removeQueue(id);
     }
   }
 
   _auth(req, res) {
-    const key = req.query.key;
+    const key = req.query.key || req.headers.authorization?.replace("Bearer ", "");
     if (key === SECRET_KEY) {
       delete req.query.key;
       log("info", `验证通过: ${req.method} ${req.path}`);
@@ -170,55 +171,119 @@ class Handler {
     return false;
   }
 
-  _buildReq(req, id) {
+  _buildReq(req, id, isOpenAI) {
     let body = "";
-    if (Buffer.isBuffer(req.body)) body = req.body.toString("utf-8");
-    else if (typeof req.body === "string") body = req.body;
-    else if (req.body) body = JSON.stringify(req.body);
+    let convertedBody = req.body;
+
+    if (isOpenAI && req.body) {
+      convertedBody = this._convertOpenAIToGemini(req.body);
+    }
+
+    if (Buffer.isBuffer(convertedBody)) body = convertedBody.toString("utf-8");
+    else if (typeof convertedBody === "string") body = convertedBody;
+    else if (convertedBody) body = JSON.stringify(convertedBody);
 
     return {
-      path: req.path,
+      path: isOpenAI ? this._convertOpenAIPath(req) : req.path,
       method: req.method,
       headers: req.headers,
-      query_params: req.query,
+      query_params: isOpenAI ? this._convertOpenAIQuery(req) : req.query,
       body,
       request_id: id,
       streaming_mode: this.server.mode,
+      is_openai: isOpenAI,
     };
   }
 
-  async _dispatch(req, res, proxyReq, queue) {
+  _convertOpenAIPath(req) {
+    const model = req.body?.model || "gemini-2.0-flash-exp";
+    const isStream = req.body?.stream === true;
+    const action = isStream ? "streamGenerateContent" : "generateContent";
+    return `/v1beta/models/${model}:${action}`;
+  }
+
+  _convertOpenAIQuery(req) {
+    const query = { ...req.query };
+    if (req.body?.stream === true) {
+      query.alt = "sse";
+    }
+    return query;
+  }
+
+  _convertOpenAIToGemini(openaiBody) {
+    const messages = openaiBody.messages || [];
+    const contents = [];
+    let systemInstruction = null;
+
+    for (const msg of messages) {
+      if (msg.role === "system") {
+        systemInstruction = { parts: [{ text: msg.content }] };
+      } else {
+        contents.push({
+          role: msg.role === "assistant" ? "model" : "user",
+          parts: [{ text: msg.content }],
+        });
+      }
+    }
+
+    const geminiBody = { contents };
+    if (systemInstruction) {
+      geminiBody.systemInstruction = systemInstruction;
+    }
+
+    if (openaiBody.temperature !== undefined) {
+      geminiBody.generationConfig = geminiBody.generationConfig || {};
+      geminiBody.generationConfig.temperature = openaiBody.temperature;
+    }
+    if (openaiBody.max_tokens !== undefined) {
+      geminiBody.generationConfig = geminiBody.generationConfig || {};
+      geminiBody.generationConfig.maxOutputTokens = openaiBody.max_tokens;
+    }
+
+    return geminiBody;
+  }
+
+  async _dispatch(req, res, proxyReq, queue, isOpenAI) {
     const mode = this.server.mode;
-    const stream = req.path.includes("streamGenerateContent");
+    const stream = isOpenAI 
+      ? req.body?.stream === true 
+      : req.path.includes("streamGenerateContent");
 
     if (mode === "fake") {
       return stream
-        ? this._fakeStream(req, res, proxyReq, queue)
-        : this._fakeNonStream(res, proxyReq, queue);
+        ? this._fakeStream(req, res, proxyReq, queue, isOpenAI)
+        : this._fakeNonStream(res, proxyReq, queue, isOpenAI);
     }
-    return this._realStream(res, proxyReq, queue, stream);
+    return this._realStream(res, proxyReq, queue, stream, isOpenAI);
   }
 
-  async _fakeNonStream(res, proxyReq, queue) {
+  async _fakeNonStream(res, proxyReq, queue, isOpenAI) {
     log("info", "非流式请求");
     this._forward(proxyReq);
 
     const header = await queue.pop();
     if (header.event_type === "error") {
-      return this._send(res, header.status || 500, header.message);
+      return this._send(res, header.status || 500, header.message, isOpenAI);
     }
 
     this._setHeaders(res, header);
     const data = await queue.pop();
     await queue.pop();
 
-    if (data.data) res.send(data.data);
+    if (data.data) {
+      const responseData = isOpenAI 
+        ? this._convertGeminiToOpenAI(data.data, false) 
+        : data.data;
+      res.send(responseData);
+    }
     log("info", "JSON响应完成");
   }
 
-  async _fakeStream(req, res, proxyReq, queue) {
+  async _fakeStream(req, res, proxyReq, queue, isOpenAI) {
     this._sseHeaders(res);
-    const keepAlive = this._keepAlive(req.path);
+    const keepAlive = isOpenAI 
+      ? this._openAIKeepAlive() 
+      : this._keepAlive(req.path);
     const timer = setInterval(() => res.write(keepAlive), 1000);
 
     try {
@@ -227,7 +292,7 @@ class Handler {
 
       const header = await queue.pop();
       if (header.event_type === "error") {
-        this._sseError(res, header.message);
+        this._sseError(res, header.message, isOpenAI);
         throw new Error(header.message);
       }
 
@@ -235,7 +300,16 @@ class Handler {
       await queue.pop();
 
       if (data.data) {
-        res.write(`data: ${data.data}\n\n`);
+        const responseData = isOpenAI 
+          ? this._convertGeminiToOpenAI(data.data, true) 
+          : data.data;
+        
+        if (isOpenAI) {
+          res.write(responseData);
+          res.write("data: [DONE]\n\n");
+        } else {
+          res.write(`data: ${responseData}\n\n`);
+        }
         log("info", "SSE响应完成");
       }
     } finally {
@@ -245,12 +319,12 @@ class Handler {
     }
   }
 
-  async _realStream(res, proxyReq, queue, isStreamReq) {
+  async _realStream(res, proxyReq, queue, isStreamReq, isOpenAI) {
     this._forward(proxyReq);
     const header = await queue.pop();
 
     if (header.event_type === "error") {
-      return this._send(res, header.status, header.message);
+      return this._send(res, header.status, header.message, isOpenAI);
     }
 
     if (isStreamReq && !header.headers?.["content-type"]) {
@@ -265,12 +339,100 @@ class Handler {
       while (true) {
         const data = await queue.pop();
         if (data.type === "STREAM_END") break;
-        if (data.data) res.write(data.data);
+        
+        if (data.data) {
+          if (isOpenAI) {
+            const converted = this._convertGeminiSSEToOpenAI(data.data);
+            res.write(converted);
+          } else {
+            res.write(data.data);
+          }
+        }
+      }
+      
+      if (isOpenAI) {
+        res.write("data: [DONE]\n\n");
       }
     } finally {
       if (!res.writableEnded) res.end();
       log("info", "真流式结束");
     }
+  }
+
+  _convertGeminiToOpenAI(geminiData, isStream) {
+    try {
+      const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
+      const text = gemini.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const finishReason = gemini.candidates?.[0]?.finishReason;
+
+      if (isStream) {
+        const chunk = {
+          id: `chatcmpl-${genId()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4",
+          choices: [{
+            index: 0,
+            delta: { content: text },
+            finish_reason: finishReason === "STOP" ? "stop" : null,
+          }],
+        };
+        return `data: ${JSON.stringify(chunk)}\n\n`;
+      } else {
+        return JSON.stringify({
+          id: `chatcmpl-${genId()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4",
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: text },
+            finish_reason: finishReason === "STOP" ? "stop" : "length",
+          }],
+          usage: {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+          },
+        });
+      }
+    } catch (err) {
+      log("error", `转换失败: ${err.message}`);
+      return geminiData;
+    }
+  }
+
+  _convertGeminiSSEToOpenAI(sseData) {
+    const lines = sseData.split("\n");
+    let result = "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      
+      try {
+        const gemini = JSON.parse(line.slice(6));
+        const text = gemini.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const finishReason = gemini.candidates?.[0]?.finishReason;
+
+        const chunk = {
+          id: `chatcmpl-${genId()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4",
+          choices: [{
+            index: 0,
+            delta: text ? { content: text } : {},
+            finish_reason: finishReason === "STOP" ? "stop" : null,
+          }],
+        };
+        result += `data: ${JSON.stringify(chunk)}\n\n`;
+      } catch (err) {
+        // 保持原始行
+        result += line + "\n";
+      }
+    }
+
+    return result;
   }
 
   _forward(proxyReq) {
@@ -319,29 +481,63 @@ class Handler {
     return "data: {}\n\n";
   }
 
-  _sseError(res, msg) {
-    if (res.writableEnded) return;
-    res.write(
-      `data: ${JSON.stringify({
-        error: { message: `[代理] ${msg}`, type: "proxy_error", code: "proxy_error" },
-      })}\n\n`
-    );
+  _openAIKeepAlive() {
+    return `data: ${JSON.stringify({
+      id: `chatcmpl-${genId()}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: "gpt-4",
+      choices: [{ index: 0, delta: {}, finish_reason: null }],
+    })}\n\n`;
   }
 
-  _error(err, res) {
+  _sseError(res, msg, isOpenAI) {
+    if (res.writableEnded) return;
+    
+    if (isOpenAI) {
+      res.write(
+        `data: ${JSON.stringify({
+          error: {
+            message: `[代理] ${msg}`,
+            type: "proxy_error",
+            code: "proxy_error",
+          },
+        })}\n\n`
+      );
+    } else {
+      res.write(
+        `data: ${JSON.stringify({
+          error: { message: `[代理] ${msg}`, type: "proxy_error", code: "proxy_error" },
+        })}\n\n`
+      );
+    }
+  }
+
+  _error(err, res, isOpenAI) {
     if (res.headersSent) {
       log("error", `错误(头已发): ${err.message}`);
-      if (this.server.mode === "fake") this._sseError(res, err.message);
+      if (this.server.mode === "fake") this._sseError(res, err.message, isOpenAI);
       if (!res.writableEnded) res.end();
       return;
     }
     log("error", `错误: ${err.message}`);
-    this._send(res, 500, `代理错误: ${err.message}`);
+    this._send(res, 500, `代理错误: ${err.message}`, isOpenAI);
   }
 
-  _send(res, status, msg) {
+  _send(res, status, msg, isOpenAI) {
     if (res.headersSent) return;
-    res.status(status).type("text/plain").send(msg);
+    
+    if (isOpenAI && status >= 400) {
+      res.status(status).json({
+        error: {
+          message: msg,
+          type: "proxy_error",
+          code: "proxy_error",
+        },
+      });
+    } else {
+      res.status(status).type("text/plain").send(msg);
+    }
   }
 }
 
