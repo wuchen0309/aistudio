@@ -547,36 +547,10 @@ class Handler {
     try {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
       const candidate = gemini.candidates?.[0];
-      
-      // 提取内容
-      const contentParts = [];
-      if (candidate?.content?.parts) {
-        for (const part of candidate.content.parts) {
-          if (part.text) {
-            contentParts.push({
-              type: "text",
-              text: part.text
-            });
-          } else if (part.inlineData) {
-            contentParts.push({
-              type: "image_url",
-              image_url: {
-                url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-              }
-            });
-          }
-        }
-      }
-      
+      const text = candidate?.content?.parts?.map(p => p.text || "").join("") || "";
       const finishReason = candidate?.finishReason;
 
       if (isStream) {
-        // 流式：每个 chunk 单独返回
-        const delta = {};
-        if (contentParts.length > 0) {
-          delta.content = contentParts;
-        }
-
         return `data: ${JSON.stringify({
           id: `chatcmpl-${genId()}`,
           object: "chat.completion.chunk",
@@ -584,23 +558,11 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: delta,
+            delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         })}\n\n`;
       } else {
-        // 非流式：返回完整内容
-        let content;
-        if (contentParts.length === 0) {
-          content = "";
-        } else if (contentParts.length === 1 && contentParts[0].type === "text") {
-          // 纯文本，返回字符串
-          content = contentParts[0].text;
-        } else {
-          // 多模态，返回数组
-          content = contentParts;
-        }
-
         return JSON.stringify({
           id: `chatcmpl-${genId()}`,
           object: "chat.completion",
@@ -608,10 +570,7 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            message: {
-              role: "assistant",
-              content: content
-            },
+            message: { role: "assistant", content: text },
             finish_reason: finishReason === "STOP" ? "stop" : "length",
           }],
         });
@@ -632,31 +591,8 @@ class Handler {
       try {
         const gemini = JSON.parse(line.slice(6));
         const candidate = gemini.candidates?.[0];
-        
-        const contentParts = [];
-        if (candidate?.content?.parts) {
-          for (const part of candidate.content.parts) {
-            if (part.text) {
-              contentParts.push({
-                type: "text",
-                text: part.text
-              });
-            } else if (part.inlineData) {
-              contentParts.push({
-                type: "image_url",
-                image_url: {
-                  url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-                }
-              });
-            }
-          }
-        }
-        
+        const text = candidate?.content?.parts?.map(p => p.text || "").join("") || "";
         const finishReason = candidate?.finishReason;
-        const delta = {};
-        if (contentParts.length > 0) {
-          delta.content = contentParts;
-        }
 
         result += `data: ${JSON.stringify({
           id: `chatcmpl-${genId()}`,
@@ -665,7 +601,7 @@ class Handler {
           model: "gpt-4",
           choices: [{
             index: 0,
-            delta: delta,
+            delta: text ? { content: text } : {},
             finish_reason: finishReason === "STOP" ? "stop" : null,
           }],
         })}\n\n`;
