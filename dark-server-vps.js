@@ -136,7 +136,7 @@ class Handler {
   }
 
   async handle(req, res) {
-    // 特殊路径不需要认证
+    // 特殊路径
     if (req.path === "/v1/models") {
       return this._handleModels(req, res);
     }
@@ -158,51 +158,98 @@ class Handler {
     }
   }
 
-  _handleModels(req, res) {
+  async _handleModels(req, res) {
     log("info", "模型列表请求");
-    res.status(200).json({
+    
+    if (!this.conns.hasConn()) {
+      return res.status(503).json({
+        error: {
+          message: "无可用连接",
+          type: "service_unavailable",
+          code: "no_connection",
+        },
+      });
+    }
+
+    const id = genId();
+    const proxyReq = {
+      path: "/v1beta/models",
+      method: "GET",
+      headers: {},
+      query_params: {},
+      body: "",
+      request_id: id,
+      streaming_mode: "real",
+      is_openai: false,
+    };
+
+    const queue = this.conns.createQueue(id);
+
+    try {
+      this._forward(proxyReq);
+      const header = await queue.pop();
+      
+      if (header.event_type === "error") {
+        return res.status(header.status || 500).json({
+          error: {
+            message: header.message,
+            type: "api_error",
+            code: "model_list_error",
+          },
+        });
+      }
+
+      const data = await queue.pop();
+      await queue.pop();
+
+      if (data.data) {
+        const geminiModels = JSON.parse(data.data);
+        const openaiModels = this._convertModelsToOpenAI(geminiModels);
+        res.status(200).json(openaiModels);
+      } else {
+        res.status(500).json({
+          error: {
+            message: "无法获取模型列表",
+            type: "api_error",
+            code: "empty_response",
+          },
+        });
+      }
+    } catch (err) {
+      log("error", `获取模型列表失败: ${err.message}`);
+      res.status(500).json({
+        error: {
+          message: `获取模型列表失败: ${err.message}`,
+          type: "proxy_error",
+          code: "model_list_error",
+        },
+      });
+    } finally {
+      this.conns.removeQueue(id);
+    }
+  }
+
+  _convertModelsToOpenAI(geminiData) {
+    const models = geminiData.models || [];
+    const openaiModels = models
+      .filter(model => {
+        // 只返回 generateContent 方法的模型
+        return model.supportedGenerationMethods?.includes("generateContent");
+      })
+      .map(model => ({
+        id: model.name.replace("models/", ""),
+        object: "model",
+        created: Math.floor(new Date(model.updateTime || Date.now()).getTime() / 1000),
+        owned_by: "google",
+        permission: [],
+        root: model.name.replace("models/", ""),
+        parent: null,
+      }));
+
+    return {
       object: "list",
-      data: [
-        {
-          id: "gemini-2.0-flash-exp",
-          object: "model",
-          created: 1700000000,
-          owned_by: "google",
-        },
-        {
-          id: "gemini-exp-1206",
-          object: "model",
-          created: 1700000000,
-          owned_by: "google",
-        },
-        {
-          id: "gemini-1.5-pro",
-          object: "model",
-          created: 1700000000,
-          owned_by: "google",
-        },
-        {
-          id: "gemini-1.5-flash",
-          object: "model",
-          created: 1700000000,
-          owned_by: "google",
-        },
-        {
-          id: "gpt-4",
-          object: "model",
-          created: 1700000000,
-          owned_by: "openai",
-          description: "Alias for gemini-2.0-flash-exp",
-        },
-        {
-          id: "gpt-3.5-turbo",
-          object: "model",
-          created: 1700000000,
-          owned_by: "openai",
-          description: "Alias for gemini-1.5-flash",
-        },
-      ],
-    });
+      data: openaiModels,
+    };
   }
 
   _auth(req, res) {
