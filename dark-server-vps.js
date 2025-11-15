@@ -136,6 +136,11 @@ class Handler {
   }
 
   async handle(req, res) {
+    // 特殊路径不需要认证
+    if (req.path === "/v1/models") {
+      return this._handleModels(req, res);
+    }
+
     if (!this._auth(req, res)) return;
     if (!this._checkConn(res)) return;
 
@@ -153,14 +158,65 @@ class Handler {
     }
   }
 
+  _handleModels(req, res) {
+    log("info", "模型列表请求");
+    res.json({
+      object: "list",
+      data: [
+        {
+          id: "gemini-2.0-flash-exp",
+          object: "model",
+          created: 1700000000,
+          owned_by: "google",
+        },
+        {
+          id: "gemini-1.5-pro",
+          object: "model",
+          created: 1700000000,
+          owned_by: "google",
+        },
+        {
+          id: "gemini-1.5-flash",
+          object: "model",
+          created: 1700000000,
+          owned_by: "google",
+        },
+        {
+          id: "gpt-4",
+          object: "model",
+          created: 1700000000,
+          owned_by: "openai",
+          description: "Alias for gemini-2.0-flash-exp",
+        },
+        {
+          id: "gpt-3.5-turbo",
+          object: "model",
+          created: 1700000000,
+          owned_by: "openai",
+          description: "Alias for gemini-1.5-flash",
+        },
+      ],
+    });
+  }
+
   _auth(req, res) {
-    const key = req.query.key || req.headers.authorization?.replace("Bearer ", "");
+    // 从 query 或 Authorization header 获取密钥
+    let key = req.query.key;
+    
+    if (!key && req.headers.authorization) {
+      const auth = req.headers.authorization;
+      if (auth.startsWith("Bearer ")) {
+        key = auth.substring(7);
+      }
+    }
+
     if (key === SECRET_KEY) {
       delete req.query.key;
       log("info", `验证通过: ${req.method} ${req.path}`);
       return true;
     }
-    log("warn", `验证失败: ${req.url}`);
+    
+    log("warn", `验证失败: ${req.path} (提供的密钥: ${key ? key.substring(0, 3) + "***" : "无"})`);
     this._send(res, 401, "Unauthorized");
     return false;
   }
@@ -527,11 +583,7 @@ class Handler {
   _send(res, status, msg, isOpenAI) {
     if (res.headersSent) return;
     
-    if (isOpenAI && status >= 400) {
-      res.status(status).json({
-        error: {
-          message: msg,
-          type: "proxy_error",
+    if (isOpenAI && status >=",
           code: "proxy_error",
         },
       });
