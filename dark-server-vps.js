@@ -288,7 +288,6 @@ class Handler {
     let convertedBody = req.body;
 
     if (isOpenAI && req.body) {
-      log("info", `原始 OpenAI 请求: ${JSON.stringify(req.body, null, 2)}`);
       try {
         convertedBody = this._convertOpenAIToGemini(req.body);
       } catch (err) {
@@ -301,7 +300,7 @@ class Handler {
     else if (typeof convertedBody === "string") body = convertedBody;
     else if (convertedBody) body = JSON.stringify(convertedBody);
 
-    const finalReq = {
+    return {
       path: isOpenAI ? this._convertOpenAIPath(req) : req.path,
       method: req.method,
       headers: req.headers,
@@ -311,11 +310,6 @@ class Handler {
       streaming_mode: this.server.mode,
       is_openai: isOpenAI,
     };
-
-    log("info", `最终请求路径: ${finalReq.path}`);
-    log("info", `查询参数: ${JSON.stringify(finalReq.query_params)}`);
-
-    return finalReq;
   }
 
   _convertOpenAIPath(req) {
@@ -352,7 +346,6 @@ class Handler {
     }
 
     if (contents.length === 0) {
-      log("error", "没有有效的用户消息");
       throw new Error("至少需要一条用户或助手消息");
     }
 
@@ -397,7 +390,6 @@ class Handler {
         : [openaiBody.stop];
     }
     
-    // 思考配置 - 只支持数值形式的 token 预算
     if (openaiBody.thinking_budget !== undefined && openaiBody.thinking_budget > 0) {
       genConfig.thinkingConfig = {
         thoughtGenerationTokenBudget: Math.max(1, Math.floor(openaiBody.thinking_budget))
@@ -408,8 +400,6 @@ class Handler {
     if (Object.keys(genConfig).length > 0) {
       geminiBody.generationConfig = genConfig;
     }
-
-    log("info", `转换后的请求体: ${JSON.stringify(geminiBody, null, 2)}`);
 
     return geminiBody;
   }
@@ -443,7 +433,6 @@ class Handler {
 
     if (data.data) {
       if (isOpenAI) {
-        log("info", `Gemini 原始响应: ${data.data.substring(0, 500)}...`);
         const responseData = this._convertGeminiToOpenAI(data.data, false);
         res.json(JSON.parse(responseData));
       } else {
@@ -475,7 +464,6 @@ class Handler {
 
       if (data.data) {
         if (isOpenAI) {
-          log("info", `Gemini 原始响应: ${data.data.substring(0, 500)}...`);
           const responseData = this._convertGeminiToOpenAI(data.data, true);
           res.write(responseData);
           res.write("data: [DONE]\n\n");
@@ -517,9 +505,6 @@ class Handler {
         
         if (data.data) {
           chunkCount++;
-          if (chunkCount <= 2) {
-            log("info", `收到数据块 #${chunkCount}: ${data.data.substring(0, 200)}...`);
-          }
           
           if (isOpenAI && isStreamReq) {
             const converted = this._convertGeminiSSEToOpenAI(data.data);
@@ -535,7 +520,6 @@ class Handler {
       if (isOpenAI && isStreamReq) {
         res.write("data: [DONE]\n\n");
       } else if (isOpenAI && !isStreamReq) {
-        log("info", `完整响应: ${fullResponse.substring(0, 500)}...`);
         const jsonResponse = this._convertGeminiToOpenAI(fullResponse, false);
         res.json(JSON.parse(jsonResponse));
       }
@@ -548,15 +532,29 @@ class Handler {
   _convertGeminiToOpenAI(geminiData, isStream) {
     try {
       const gemini = typeof geminiData === "string" ? JSON.parse(geminiData) : geminiData;
+      
+      log("info", `===== Gemini 原始数据结构 =====`);
+      log("info", `完整数据: ${JSON.stringify(gemini, null, 2)}`);
+      
       const candidate = gemini.candidates?.[0];
+      
+      if (candidate?.content?.parts) {
+        log("info", `Parts 数量: ${candidate.content.parts.length}`);
+        candidate.content.parts.forEach((part, idx) => {
+          log("info", `Part[${idx}]: ${JSON.stringify(part, null, 2)}`);
+        });
+      }
       
       let text = "";
       let thinkingText = null;
       
       if (candidate?.content?.parts) {
         for (const part of candidate.content.parts) {
+          log("info", `处理 part: thought=${part.thought}, text长度=${part.text?.length || 0}`);
+          
           if (part.thought === true) {
             thinkingText = (thinkingText || "") + (part.text || "");
+            log("info", `找到思考内容，长度: ${part.text?.length || 0}`);
           } else if (part.text) {
             text += part.text;
           }
@@ -566,9 +564,9 @@ class Handler {
       const finishReason = candidate?.finishReason;
       const usage = gemini.usageMetadata;
 
-      log("info", `提取内容 - 文本长度: ${text.length}, 思考长度: ${thinkingText ? thinkingText.length : 0}`);
+      log("info", `最终提取 - 文本: ${text.length}, 思考: ${thinkingText ? thinkingText.length : 0}`);
       if (usage) {
-        log("info", `Token 使用: prompt=${usage.promptTokenCount}, completion=${usage.candidatesTokenCount}, total=${usage.totalTokenCount}`);
+        log("info", `Token: ${usage.promptTokenCount}/${usage.candidatesTokenCount}/${usage.totalTokenCount}`);
       }
 
       if (isStream) {
@@ -624,7 +622,7 @@ class Handler {
       }
     } catch (err) {
       log("error", `转换失败: ${err.message}`);
-      log("error", `原始数据: ${JSON.stringify(geminiData).substring(0, 500)}`);
+      log("error", `堆栈: ${err.stack}`);
       return geminiData;
     }
   }
@@ -632,9 +630,12 @@ class Handler {
   _convertGeminiSSEToOpenAI(sseData) {
     const lines = sseData.split("\n");
     let result = "";
+    let lineCount = 0;
 
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
+      
+      lineCount++;
       
       try {
         const gemini = JSON.parse(line.slice(6));
@@ -647,6 +648,7 @@ class Handler {
           for (const part of candidate.content.parts) {
             if (part.thought === true) {
               thinkingText = (thinkingText || "") + (part.text || "");
+              log("info", `SSE#${lineCount} 找到思考`);
             } else if (part.text) {
               text += part.text;
             }
