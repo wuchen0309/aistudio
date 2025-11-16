@@ -4,4 +4,4 @@ COPY package.json .
 RUN npm install --omit=dev
 COPY . .
 EXPOSE 7860
-CMD ["npm", "start"]
+CMD ["node", "dark-server-vps.js"]
