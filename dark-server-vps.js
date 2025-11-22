@@ -246,6 +246,8 @@ class Handler {
   }
 
   #auth = (req, res) => {
+    // 允许预检请求通过认证，或检查 key
+    if (req.method === 'OPTIONS') return true;
     if ((req.query.key || req.headers.authorization?.substring(7)) === SECRET_KEY) return true;
     this.#send(res, 401, "Unauthorized", true);
     return false;
@@ -259,7 +261,7 @@ class Handler {
 
   #buildNativeReq(req, id) {
     const query = { ...req.query };
-    delete query.key; // *** FIXED: Remove key from native requests as well
+    delete query.key;
     const body = Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : (typeof req.body === "object" ? JSON.stringify(req.body) : req.body);
     return { path: req.path, method: req.method, headers: req.headers, query_params: query, body, request_id: id, streaming_mode: this.#server.mode };
   }
@@ -361,6 +363,22 @@ class Server {
 
   async start(conns) {
     const app = express();
+
+    // --- 🔥🔥🔥 CORS 修复开始 🔥🔥🔥 ---
+    // 手动添加跨域头，无需安装额外依赖
+    app.use((req, res, next) => {
+      res.header("Access-Control-Allow-Origin", "*"); // 允许所有来源
+      res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+      res.header("Access-Control-Allow-Headers", "*"); // 允许所有头 (Content-Type, Authorization 等)
+      
+      // 如果是浏览器的预检请求(OPTIONS)，直接返回成功
+      if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+      }
+      next();
+    });
+    // --- 🔥🔥🔥 CORS 修复结束 🔥🔥🔥 ---
+
     app.use(express.json({ limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
 
